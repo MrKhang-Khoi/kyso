@@ -148,6 +148,16 @@ async function runF12MatrixAudit() {
 
   const page = await context.newPage();
 
+  // Đảm bảo không bị nghẽn mạng ngoại vi từ CDN công cộng trong môi trường kiểm thử cục bộ
+  await page.route('https://cdn.tailwindcss.com/**', (route) => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/javascript; charset=utf-8',
+      headers: { 'access-control-allow-origin': '*' },
+      body: 'window.tailwind = window.tailwind || { config: {} };'
+    });
+  });
+
   const capturedLogs = {
     errors: [],
     warnings: [],
