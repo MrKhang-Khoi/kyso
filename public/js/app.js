@@ -47,6 +47,23 @@ function removeSafeStorageItem(key) {
   }
 }
 
+let _isHandling401 = false;
+function handleExpiredSession() {
+  if (_isHandling401) return;
+  _isHandling401 = true;
+  console.warn('[Auth] Mã xác thực (Token) đã hết hạn hoặc không hợp lệ (401). Đang làm sạch phiên làm việc...');
+  if (typeof appState !== 'undefined' && appState) {
+    appState.token = null;
+  }
+  removeSafeStorageItem('edusign_token');
+  if (typeof showToast === 'function') {
+    showToast('⚠️ Phiên làm việc trên máy chủ đã hết hạn. Đang sử dụng chế độ đồng bộ đám mây Firebase. Vui lòng đăng nhập lại khi cần nộp hồ sơ mới.', 'warning');
+  }
+  setTimeout(() => {
+    _isHandling401 = false;
+  }, 10000);
+}
+
 function getSafeInitialUser() {
   const rawUser = getSafeStorageItem('edusign_user');
   if (!rawUser || typeof rawUser !== 'string') return null;
@@ -4009,8 +4026,11 @@ async function loadTeacherPendingDocuments(force = false) {
         const headers = {
           'Content-Type': 'application/json'
         };
-        if (hasAuthToken) {
+        if (hasAuthToken && appState?.token) {
           headers['Authorization'] = `Bearer ${appState.token.trim()}`;
+          headers['x-auth-token'] = appState.token.trim();
+          if (appState.currentUser?.id) headers['x-user-id'] = appState.currentUser.id;
+          if (appState.currentUser?.username) headers['x-user-username'] = appState.currentUser.username;
         }
 
         const fetchEndpoint = (window.location.protocol === 'file:' && window._mockPendingList !== undefined)
@@ -4021,7 +4041,9 @@ async function loadTeacherPendingDocuments(force = false) {
           headers,
           cache: 'no-store'
         });
-        if (res.ok) {
+        if (res.status === 401) {
+          handleExpiredSession();
+        } else if (res.ok) {
           const json = await res.json();
           if (json.success && Array.isArray(json.data)) {
             pendingList = json.data;
@@ -4220,6 +4242,9 @@ async function loadTeacherSentDocuments(force = false) {
         };
         if (hasAuthToken && appState?.token) {
           headers['Authorization'] = `Bearer ${appState.token.trim()}`;
+          headers['x-auth-token'] = appState.token.trim();
+          if (appState.currentUser?.id) headers['x-user-id'] = appState.currentUser.id;
+          if (appState.currentUser?.username) headers['x-user-username'] = appState.currentUser.username;
         }
 
         const fetchEndpoint = (window.location.protocol === 'file:' && window._mockSentList !== undefined)
@@ -4227,7 +4252,9 @@ async function loadTeacherSentDocuments(force = false) {
           : (API_BASE ? `${API_BASE}/api/documents/sent` : '/api/documents/sent');
 
         const res = await fetch(fetchEndpoint, { headers, cache: 'no-store' });
-        if (res.ok) {
+        if (res.status === 401) {
+          handleExpiredSession();
+        } else if (res.ok) {
           const json = await res.json();
           if (json && json.success && Array.isArray(json.data)) {
             sentList = json.data;
@@ -4570,11 +4597,18 @@ async function loadTeacherReturnedDocuments(force = false) {
         const headers = {
           'Content-Type': 'application/json'
         };
-        if (hasAuthToken && appState?.token) headers['Authorization'] = `Bearer ${appState.token.trim()}`;
+        if (hasAuthToken && appState?.token) {
+          headers['Authorization'] = `Bearer ${appState.token.trim()}`;
+          headers['x-auth-token'] = appState.token.trim();
+          if (appState.currentUser?.id) headers['x-user-id'] = appState.currentUser.id;
+          if (appState.currentUser?.username) headers['x-user-username'] = appState.currentUser.username;
+        }
 
         const fetchEndpoint = API_BASE ? `${API_BASE}/api/documents/returned` : '/api/documents/returned';
         const res = await fetch(fetchEndpoint, { headers, cache: 'no-store' });
-        if (res.ok) {
+        if (res.status === 401) {
+          handleExpiredSession();
+        } else if (res.ok) {
           const json = await res.json();
           if (json && json.success && Array.isArray(json.data)) {
             returnedList = json.data;
