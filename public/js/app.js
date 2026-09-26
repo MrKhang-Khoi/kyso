@@ -86,9 +86,16 @@ function getSafeInitialUser() {
         username: String(parsed.username).trim(),
         fullName: typeof parsed.fullName === 'string' ? parsed.fullName : (typeof parsed.name === 'string' ? parsed.name : parsed.username),
         role: String(parsed.role).trim().toUpperCase(),
+        roleTitle: typeof parsed.roleTitle === 'string' ? parsed.roleTitle : '',
         department: typeof parsed.department === 'string' ? parsed.department : '',
+        departmentId: typeof parsed.departmentId === 'string' ? parsed.departmentId : '',
+        departmentName: typeof parsed.departmentName === 'string' ? parsed.departmentName : '',
         phone: typeof parsed.phone === 'string' ? parsed.phone : '',
-        email: typeof parsed.email === 'string' ? parsed.email : ''
+        email: typeof parsed.email === 'string' ? parsed.email : '',
+        cccd: (typeof parsed.cccd === 'string' || typeof parsed.cccd === 'number') ? String(parsed.cccd).trim() : '',
+        signType: typeof parsed.signType === 'string' ? parsed.signType : '',
+        canUploadWord: Boolean(parsed.canUploadWord),
+        canStampSeal: Boolean(parsed.canStampSeal)
       };
     }
     // Nếu schema không hợp lệ hoặc thiếu trường nhận diện tối thiểu, xóa dữ liệu rác
@@ -148,10 +155,18 @@ let appState = {
 };
 window.appState = appState;
 
-// Tự động đồng bộ SĐT cho giáo viên Hà Văn Tý nếu phiên làm việc cũ lưu chuỗi rỗng
-if (appState.currentUser && (appState.currentUser.username === 'cva.ty' || appState.currentUser.id === 'user_cvaty')) {
+// Tự động đồng bộ SĐT & CCCD cho giáo viên Hà Văn Tý nếu phiên làm việc cũ lưu thiếu
+if (appState.currentUser && (appState.currentUser.username === 'cva.ty' || appState.currentUser.id === 'user_cvaty' || appState.currentUser.id === 'user_mtsq01uj_evak')) {
+  let needsSync = false;
   if (!appState.currentUser.phone) {
     appState.currentUser.phone = '0818810007';
+    needsSync = true;
+  }
+  if (!appState.currentUser.cccd) {
+    appState.currentUser.cccd = '042084002100';
+    needsSync = true;
+  }
+  if (needsSync) {
     setSafeStorageItem('edusign_user', JSON.stringify(appState.currentUser));
   }
 }
@@ -540,6 +555,9 @@ function initFirebaseRealtime() {
             localStorage.setItem('edusign_user', JSON.stringify(appState.currentUser));
             console.log('[Realtime Live Sync] Đã cập nhật hồ sơ từ Admin:', appState.currentUser.username, '| Quyền Word:', appState.currentUser.canUploadWord, '| Quyền Đóng dấu:', appState.currentUser.canStampSeal);
           }
+          if (typeof checkUserAccountIntegrity === 'function') {
+            checkUserAccountIntegrity(appState.currentUser);
+          }
         }
       }
       if (typeof updateWordUploadUI === 'function') {
@@ -818,7 +836,8 @@ function checkUserAccountIntegrity(user) {
 
   if (!isBgh) {
     // Giáo viên: Bắt buộc có CCCD 12 số để định danh khớp với Virtual CSP
-    const hasValidCccd = user.cccd && /^\d{12}$/.test(String(user.cccd).trim());
+    const cleanCccd = String(user.cccd || '').replace(/\D/g, '').trim();
+    const hasValidCccd = cleanCccd.length === 12;
     if (bannerTeacher) {
       if (!hasValidCccd) {
         bannerTeacher.classList.remove('hidden');
