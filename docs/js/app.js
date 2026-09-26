@@ -8269,6 +8269,41 @@ async function handleTeacherSignAction() {
     return;
   }
 
+  // 3. Ràng buộc người nhận đối với Báo cáo / Biên bản chuyên môn (Chained Signing Guard)
+  const choice = document.querySelector('input[name="docTypeChoice"]:checked')?.value || 'LESSON_PLAN';
+  if (choice === 'REPORT') {
+    const reportCat = getSelectedReportCategory();
+    if (!reportCat) {
+      if (typeof highlightReportCategoryRequirement === 'function') {
+        highlightReportCategoryRequirement();
+      }
+      showModalAlert(
+        'Chưa phân loại báo cáo',
+        'Vui lòng chọn <strong>Báo cáo Chuyên môn Nội bộ</strong> (Tổ/Khối) hoặc <strong>Báo cáo Trình Ban Giám Hiệu</strong> trước khi thực hiện ký số.',
+        'warning'
+      );
+      return;
+    }
+    const isSelfApproved = Boolean(document.getElementById('cbSelfApproval')?.checked);
+    if (!isSelfApproved) {
+      const nextId = document.getElementById('selectNextSigner')?.value;
+      if (!nextId) {
+        showModalAlert(
+          'Chưa chọn người nhận tiếp theo',
+          'Đây là văn bản Báo cáo / Biên bản chuyên môn theo quy trình ký liên hoàn. Thầy/Cô vui lòng chọn Tổ trưởng hoặc Đồng nghiệp trong danh sách trước khi tiến hành ký số.',
+          'warning'
+        );
+        const sel = document.getElementById('selectNextSigner');
+        if (sel) {
+          sel.focus();
+          sel.classList.add('ring-2', 'ring-rose-500');
+          setTimeout(() => sel.classList.remove('ring-2', 'ring-rose-500'), 3000);
+        }
+        return;
+      }
+    }
+  }
+
   currentChainedPendingDoc = null;
   const chainedBar = document.getElementById('viewerChainedSignBar');
   if (chainedBar) chainedBar.classList.add('hidden');
