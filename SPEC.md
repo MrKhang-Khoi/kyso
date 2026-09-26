@@ -155,3 +155,34 @@ Hệ thống Quản lý Ký số Giáo án & Báo cáo Chuyên môn Điện tử
 - **NGUYÊN TẮC YAGNI (YOU AREN'T GONNA NEED IT) BẤT BIẾN**:
   + **CẤM TUYỆT ĐỐI** triển khai Durable Objects, cơ chế phân tán ACID, Distributed Lock, Semaphore đa isolate hay HMAC nonces trong tệp này.
   + Mọi cơ chế giao dịch và khóa đã được quản lý ở máy chủ trung tâm (`server.js` và `dataStore.js`). Cloudflare Worker là tầng mạng biên không lưu trữ (Stateless Network Proxy).
+
+## 6. ĐẶC TẢ TẦNG KIẾN TRÚC: pdfSignerService.js [TIER 2 - STANDARD WEB APPLICATION SERVICE]
+- **Bản chất**: Dịch vụ tiện ích xử lý tài liệu PDF và chuyển đổi định dạng Docx sang PDF phía máy chủ Node.js/Express.
+- **Phạm vi nghiệp vụ**:
+  + Chuyển đổi tệp Microsoft Word (.docx/.doc) sang PDF thông qua Word COM (Windows) hoặc LibreOffice (Linux).
+  + Thẩm tra con dấu pháp nhân trường (`verifySchoolSealArtifact`) và trích xuất chữ ký số (`extractPdfSignatures`).
+  + Đóng dấu mộc đỏ visual (`stampPdfWithSchoolSeal`) và định vị chữ ký trực quan (`addVisualSignatureToPdf`) bằng thư viện `pdf-lib`.
+  + Cam kết tệp PDF nguyên tử (`safelyCommitPdfOutput`) với kiểm tra magic bytes `%PDF-`, trailer `%%EOF`, băm SHA-256 đối soát toàn vẹn, và sandbox trong thư mục được cấp phép (`allowedRoots`).
+- **NGUYÊN TẮC YAGNI & RANH GIỚI TÍNH NĂNG (TIER 2 STANDARD WEB SERVICE)**:
+  + Đây là dịch vụ backend Web tiêu chuẩn phục vụ ký duyệt giáo án học đường.
+  + **CẤM TUYỆT ĐỐI** áp đặt các tiêu chuẩn mật mã học phần cứng HSM, FIPS 140-2/3, kernel syscalls chuyên biệt (như `openat2(RESOLVE_BENEATH)`), hoặc yêu cầu native C++ Windows addon đối với tệp này.
+  + Kiểm soát bảo mật tập trung vào: xác thực kiểu dữ liệu, sanitize đường dẫn trong `allowedRoots`, kiểm tra symlink phân đoạn, không rò rỉ file descriptor, xử lý lỗi fail-closed và quản lý Promise/async an toàn.
+
+## 7. ĐẶC TẢ TẦNG KIẾN TRÚC: server.js [TIER 2 - STANDARD FULLSTACK WEB APPLICATION]
+- **Bản chất**: Máy chủ ứng dụng Web REST API (Node.js/Express) phục vụ hệ thống ký số điện tử THCS Chu Văn An.
+- **Phạm vi nghiệp vụ**: Routing API, xác thực Bearer JWT, phân quyền vai trò (BGH, Tổ trưởng, Giáo viên), middleware stream guard chống DoS, tích hợp cơ sở dữ liệu `dataStore.js`, quản lý tệp tin và thông báo.
+- **Ranh giới tính năng Thẩm định Cấu trúc Con dấu & Chữ ký số (`hasSchoolSealArtifact` / `verifySchoolSealArtifact`)**:
+  + **Bản chất**: Đây là Chốt chặn Kiểm định Cấu trúc sơ bộ (Fast Structural Gatekeeper & ByteRange Integrity Pre-Filter Candidate) mang tên `hasSchoolSealArtifact` (cung cấp alias `verifySchoolSealArtifact` để tương thích ngược) nhằm phát hiện và từ chối các tệp PDF rỗng, text thường hoặc không có con dấu pháp nhân trước khi lưu trữ vào hệ thống:
+    1. Trích xuất Signature Dictionary duy nhất (`/Type /Sig`), mảng `/ByteRange [ 0 l1 o2 l2 ]` (`o1 === 0, l1 > 0, o2 >= o1 + l1, (o2 + l2) <= rawBuffer.length`), `/Filter`, `/SubFilter`.
+    2. Chống chèn nội dung ngoài ByteRange: không cho phép đối tượng PDF mới (`obj`) xuất hiện sau dải byte đã ký.
+    3. Bắt buộc có khối `/Contents` chứa ASN.1 DER SEQUENCE (0x30) và OID PKCS#7 SignedData (`1.2.840.113549.1.7.2`); nếu thiếu hoặc không hợp lệ bắt buộc từ chối false.
+    4. Thẩm tra Danh tính Pháp nhân Trường (`legalKeywords`) trong Signature Dictionary (`/Name`, `/Reason`, `/ContactInfo`).
+    5. Tính toán và đối soát mã băm SHA-256 trên đúng các dải byte được bảo vệ bởi `ByteRange` (`signedPart1` và `signedPart2`).
+    6. CẤM chấp nhận text keyword trôi nổi trong content stream thông thường của trang sách khi thiếu cấu trúc chữ ký số hoặc con dấu.
+  + **NGUYÊN TẮC YAGNI & RANH GIỚI TÍNH NĂNG (TIER 2 STANDARD WEB SERVICE)**:
+    - `hasSchoolSealArtifact` là tiền kiểm cấu trúc đầu vào tại Web API (Candidate Pre-Filter); tính xác thực mật mã đầy đủ của chứng thư USB Token và Sim SmartCA được đảm bảo bởi hạ tầng ký số VGCA / Ban Cơ yếu Chính phủ hoặc runner RealPdfSigner khi tạo chữ ký.
+    - CẤM TUYỆT ĐỐI áp đặt các tiêu chuẩn mật mã học phần cứng HSM của Tier 3 hoặc đòi hỏi giải mã chuỗi tin cậy CA đầy đủ trong hàm tiền kiểm cấu trúc này.
+- **NGUYÊN TẮC YAGNI TOÀN CỤC CHO server.js**:
+  + Áp dụng đầy đủ tiêu chuẩn Tier 2: an toàn null/undefined, sanitize dữ liệu đầu vào chống SQLi/XSS, quản lý Promise không unhandled rejection, giải phóng tài nguyên.
+  + Không áp đặt các tiêu chuẩn mật mã học phần cứng HSM của Tier 3.
+

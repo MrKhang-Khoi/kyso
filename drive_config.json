@@ -5,5 +5,6 @@
   "schoolFolderName": "KHO_HO_SO_SO_TRUONG_THCS_CHU_VAN_AN",
   "gasWebhookUrl": "https://script.google.com/macros/s/AKfycbwGBgauc9xHzRe31_IfCQD-Q9yHwGp4CfYLEam9IupcYhLpNBXbgW0J1t-weD6iUQ87ZQ/exec",
   "spreadsheetId": "1Y0HQ2Pi-XvtgmOuPqQK-H8Ay5lzVUCh9uzd54Czll2I",
+  "gasWebhookSecret": "UnifiedZaloBotTHCSCVA2026Secret",
   "backupLocalStorage": true
 }

@@ -59,3 +59,4 @@ _AgentPublish/
 # Runtime locks & transaction journals
 data/locks/
 data/transactions/
+data/transactions_backup/

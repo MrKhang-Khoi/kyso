@@ -1,65 +1,287 @@
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const zlib = require('zlib');
+const { execFile } = require('child_process');
 const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 
 /**
- * Loại bỏ dấu tiếng Việt để xuất văn bản ASCII an toàn vào PDF (WinAnsi encoding)
+ * @notice [LOSSY PRESENTATION FALLBACK]: Chuyển đổi chuỗi sang WinAnsi ASCII phục vụ hiển thị trực quan dự phòng
+ * cho pdf-lib (StandardFonts.Helvetica) khi không có fontkit/Unicode TrueType font nhúng.
+ * Tuyệt đối không dùng cho băm mật mã hoặc đối chiếu danh tính pháp lý cốt lõi.
  */
-function safeAscii(str) {
+function safeAscii(str, rejectOnDataLoss = false) {
   if (!str) return '';
-  return String(str)
+  const inputStr = String(str);
+  if (/^[\x20-\x7E]*$/.test(inputStr)) return inputStr;
+  const converted = inputStr
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/đ/g, 'd')
-    .replace(/Đ/g, 'D')
-    .replace(/[^\x20-\x7E]/g, ''); // Chỉ giữ các ký tự ASCII in được
+    .replace(/Đ/g, 'D');
+  if (rejectOnDataLoss && converted !== inputStr) {
+    throw new Error(`[pdfSignerService safeAscii] Từ chối chuyển đổi: Phát hiện mất dữ liệu ký tự tiếng Việt (${inputStr} -> ${converted})`);
+  }
+  if (/[^\x20-\x7E]/.test(converted)) {
+    throw new Error(`[pdfSignerService safeAscii] Ký tự không thể biểu diễn trong bảng mã ASCII/WinAnsi: ${JSON.stringify(str)}`);
+  }
+  return converted;
 }
 
 /**
- * Chuyển đổi tệp Microsoft Word (.docx / .doc) sang PDF bằng Word COM Automation
- * Xử lý an toàn: sao chép tạm vào os.tmpdir() (ASCII path) và dùng UTF-8 BOM cho PowerShell
- * để tránh lỗi mã hóa đường dẫn tiếng Việt (như thư mục 'KÝ SỐ')
+ * Trả về danh sách thư mục gốc hợp lệ đã được canonicalize tuyệt đối qua realpathSync
+ */
+function getCanonicalAllowedRoots() {
+  const candidates = [
+    path.resolve(__dirname),
+    path.resolve(os.tmpdir()),
+    path.resolve(process.cwd())
+  ];
+  const roots = [];
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c)) {
+        roots.push(fs.realpathSync(c));
+      }
+    } catch (e) {
+      console.warn('[pdfSignerService getCanonicalAllowedRoots] Cảnh báo chuẩn hóa root:', e.message);
+    }
+  }
+  return roots;
+}
+
+/**
+ * Kiểm tra mọi phân đoạn của đường dẫn để đảm bảo không có symbolic link nào được chèn vào
+ */
+function verifyNoSymlinkInPath(fullPath) {
+  const resolved = path.resolve(fullPath);
+  let current = resolved;
+  const parts = [];
+  while (current && current !== path.dirname(current)) {
+    parts.unshift(current);
+    current = path.dirname(current);
+  }
+  for (const p of parts) {
+    try {
+      const lstat = fs.lstatSync(p);
+      if (lstat.isSymbolicLink()) {
+        throw new Error(`[pdfSignerService] Phát hiện symbolic link không an toàn trong đường dẫn: ${p}`);
+      }
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Thẩm định và chuẩn hóa thư mục đầu ra trong phạm vi allowedRoots được cấp phép.
+ * Từ chối đường dẫn ngoài canonicalRoots, chuẩn hóa thư mục và phát hiện symlink.
+ */
+function validateCanonicalOutputDir(outDir, allowedRoots) {
+  if (!outDir || typeof outDir !== 'string') {
+    throw new TypeError('[pdfSignerService] Thư mục đầu ra không hợp lệ.');
+  }
+  const isWin = process.platform === 'win32';
+  const norm = (str) => (isWin ? str.toLowerCase() : str);
+  const absDir = path.resolve(outDir);
+  const canonicalRoots = (Array.isArray(allowedRoots) && allowedRoots.length > 0)
+    ? allowedRoots.map((r) => fs.realpathSync(r))
+    : getCanonicalAllowedRoots();
+  const matchedRoot = canonicalRoots.find((r) => norm(absDir) === norm(r) || norm(absDir).startsWith(norm(r) + path.sep));
+  if (!matchedRoot) {
+    throw new Error(`[pdfSignerService] Thư mục đích nằm ngoài phạm vi được cấp phép: ${absDir}`);
+  }
+  if (!fs.existsSync(absDir)) {
+    fs.mkdirSync(absDir, { recursive: true });
+  }
+  const realDir = fs.realpathSync(absDir);
+  const matchedReal = canonicalRoots.find((r) => norm(realDir) === norm(r) || norm(realDir).startsWith(norm(r) + path.sep));
+  if (!matchedReal) {
+    throw new Error(`[pdfSignerService] Thư mục thực tế sau khi chuẩn hóa nằm ngoài phạm vi: ${realDir}`);
+  }
+  if (!fs.statSync(realDir).isDirectory()) {
+    throw new Error(`[pdfSignerService] Đường dẫn đầu ra không phải là thư mục: ${realDir}`);
+  }
+  verifyNoSymlinkInPath(realDir);
+  return { realDir, canonicalRoots };
+}
+
+/**
+ * Ghi chú an toàn Tier 2 (Standard Web Application Service):
+ * - validateCanonicalOutputDir từ chối đường dẫn ngoài canonicalRoots và phát hiện symlink.
+ * - Thao tác ghi PDF sử dụng tệp tạm độc quyền trong realDir kết hợp hoán đổi nguyên tử.
+ */
+
+// --- HẾT LÁT CẮT 2: BẢO VỆ ĐƯỜNG DẪN VÀ THẨM ĐỊNH THƯ MỤC XUẤT CANONICAL ---
+// ============================================================================
+/**
+ * Cam kết tệp PDF nguyên tử qua tệp tạm độc quyền 'wx', fsyncSync và atomic rename.
+ * Thẩm định sanity check header/trailer, cấu trúc PDFDocument không mã hóa và đối soát mã băm SHA-256.
+ */
+async function safelyCommitPdfOutput(stagedPdfPath, targetOutputPath, allowedRoots) {
+  if (!stagedPdfPath || typeof stagedPdfPath !== 'string' || !targetOutputPath || typeof targetOutputPath !== 'string') {
+    throw new TypeError('[pdfSignerService safelyCommitPdfOutput] Đường dẫn đầu vào hoặc đầu ra không hợp lệ.');
+  }
+  const absPdf = path.resolve(targetOutputPath);
+  const outDir = path.dirname(absPdf);
+  const { realDir, canonicalRoots } = validateCanonicalOutputDir(outDir, allowedRoots);
+  verifyNoSymlinkInPath(absPdf); verifyNoSymlinkInPath(stagedPdfPath);
+  const stagedStat = fs.statSync(stagedPdfPath);
+  if (!stagedStat.isFile() || stagedStat.size < 100) {
+    throw new Error('[pdfSignerService safelyCommitPdfOutput] File PDF đầu ra rỗng hoặc quá nhỏ (< 100 bytes).');
+  }
+  const stagedContent = fs.readFileSync(stagedPdfPath);
+  const head = stagedContent.subarray(0, 10).toString('ascii');
+  if (!head.startsWith('%PDF-')) {
+    throw new Error('[pdfSignerService safelyCommitPdfOutput] File đầu ra không chứa magic bytes %PDF- hợp lệ.');
+  }
+  const tail = stagedContent.subarray(Math.max(0, stagedContent.length - 1024)).toString('latin1');
+  if (!tail.includes('%%EOF')) {
+    throw new Error('[pdfSignerService safelyCommitPdfOutput] File đầu ra thiếu trailer %%EOF.');
+  }
+  try {
+    await PDFDocument.load(stagedContent);
+  } catch (pdfErr) {
+    throw new Error(`[pdfSignerService safelyCommitPdfOutput] File PDF đầu ra bị lỗi cấu trúc hoặc mã hóa: ${pdfErr.message}`);
+  }
+  const stagedSha256 = crypto.createHash('sha256').update(stagedContent).digest('hex');
+  const tempOutput = path.join(realDir, `.tmp_conv_${crypto.randomUUID()}.pdf`);
+  const tempFd = fs.openSync(tempOutput, 'wx', 0o600);
+  let committed = false; let fdClosed = false;
+  try {
+    fs.writeSync(tempFd, stagedContent, 0, stagedContent.length);
+    fs.fsyncSync(tempFd);
+    fs.closeSync(tempFd); fdClosed = true;
+    fs.renameSync(tempOutput, absPdf); committed = true;
+  } finally {
+    if (!fdClosed) { try { fs.closeSync(tempFd); } catch (cErr) { console.warn('[pdfSignerService] Lỗi đóng tempFd:', cErr.message); } }
+    if (!committed) { try { if (fs.existsSync(tempOutput)) fs.unlinkSync(tempOutput); } catch (uErr) { console.warn('[pdfSignerService] Lỗi dọn tệp tạm:', uErr.message); } }
+  }
+  const postReal = fs.realpathSync(absPdf);
+  const isWin = process.platform === 'win32'; const norm = (s) => (isWin ? s.toLowerCase() : s);
+  const isPostAllowed = canonicalRoots.some((r) => norm(postReal) === norm(r) || norm(postReal).startsWith(norm(r) + path.sep));
+  if (!isPostAllowed || fs.lstatSync(absPdf).isSymbolicLink()) {
+    try { fs.unlinkSync(absPdf); } catch (uErr) { console.warn('[pdfSignerService] Lỗi xóa file vi phạm:', uErr.message); }
+    throw new Error('[pdfSignerService safelyCommitPdfOutput] Hậu kiểm tra tính hợp lệ file đích thất bại.');
+  }
+  const committedSha256 = crypto.createHash('sha256').update(fs.readFileSync(absPdf)).digest('hex');
+  if (committedSha256 !== stagedSha256) {
+    try { fs.unlinkSync(absPdf); } catch (uErr) { console.warn('[pdfSignerService] Lỗi xóa file sai hash:', uErr.message); }
+    throw new Error('[pdfSignerService safelyCommitPdfOutput] Phát hiện sai lệch mã băm artifact sau khi commit.');
+  }
+  return absPdf;
+}
+// --- HẾT LÁT CẮT 3: CAM KẾT NGUYÊN TỬ TỆP PDF AN TOÀN VÀ ĐỐI SOÁT SHA-256 ---
+
+// ============================================================================
+
+/**
+ * Chuyển đổi tệp Microsoft Word (.docx / .doc) sang PDF bằng Word COM Automation (Windows) hoặc LibreOffice (Linux/Cloud).
+ * Đảm bảo tính nguyên tử, thư mục cô lập per-request, giới hạn kích thước 35MB và loại bỏ TOCTOU.
  */
 function convertDocxToPdf(docxPath, outputPath) {
   return new Promise((resolve, reject) => {
-    const absDocx = path.resolve(docxPath);
-    const absPdf = path.resolve(outputPath);
-    if (!fs.existsSync(absDocx)) {
-      return reject(new Error(`Tệp Word nguồn không tồn tại: ${absDocx}`));
+    if (!docxPath || typeof docxPath !== 'string' || !outputPath || typeof outputPath !== 'string') {
+      return reject(new TypeError('[pdfSignerService convertDocxToPdf] Đường dẫn đầu vào hoặc đầu ra không hợp lệ.'));
+    }
+    const allowedRoots = getCanonicalAllowedRoots();
+    const absDocx = path.resolve(docxPath); const absPdf = path.resolve(outputPath);
+    const isWin = process.platform === 'win32'; const norm = (s) => (isWin ? s.toLowerCase() : s);
+    const isAllowed = (p) => allowedRoots.some((r) => norm(p) === norm(r) || norm(p).startsWith(norm(r) + path.sep));
+    let realDocx;
+    try {
+      validateCanonicalOutputDir(path.dirname(absPdf), allowedRoots);
+      verifyNoSymlinkInPath(absPdf); verifyNoSymlinkInPath(absDocx);
+      if (fs.existsSync(absPdf) && fs.lstatSync(absPdf).isSymbolicLink()) {
+        return reject(new Error('[pdfSignerService convertDocxToPdf] Tệp đích là symlink không hợp lệ.'));
+      }
+      realDocx = fs.realpathSync(absDocx);
+      if (!isAllowed(realDocx)) return reject(new Error('[pdfSignerService convertDocxToPdf] Tệp nguồn ngoài phạm vi cấp phép.'));
+    } catch (pathErr) { return reject(pathErr); }
+    const ext = path.extname(realDocx).toLowerCase();
+    if (ext !== '.doc' && ext !== '.docx') {
+      return reject(new Error('[pdfSignerService convertDocxToPdf] Chỉ hỗ trợ định dạng Word .doc hoặc .docx.'));
+    }
+    let sourceBuffer;
+    try {
+      const fd = fs.openSync(realDocx, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      try {
+        const fstat = fs.fstatSync(fd);
+        if (!fstat.isFile()) return reject(new Error('[pdfSignerService convertDocxToPdf] Tệp nguồn không phải tệp thường.'));
+        if (fstat.size === 0) return reject(new Error('[pdfSignerService convertDocxToPdf] Tệp Word nguồn rỗng (0 bytes).'));
+        const MAX_DOCX_SIZE = 35 * 1024 * 1024; // 35MB Stream Guard Limit
+        if (fstat.size > MAX_DOCX_SIZE) return reject(new Error('[pdfSignerService convertDocxToPdf] Tệp Word vượt 35MB.'));
+        if (!isWin && fs.existsSync(`/proc/self/fd/${fd}`)) {
+          const procPath = fs.realpathSync(`/proc/self/fd/${fd}`);
+          if (!isAllowed(procPath)) return reject(new Error('[pdfSignerService convertDocxToPdf] Descriptor ngoài phạm vi cấp phép.'));
+        }
+        sourceBuffer = Buffer.alloc(fstat.size);
+        let totalRead = 0;
+        while (totalRead < fstat.size) {
+          const bytes = fs.readSync(fd, sourceBuffer, totalRead, fstat.size - totalRead, totalRead);
+          if (bytes === 0) break;
+          totalRead += bytes;
+        }
+        if (totalRead !== fstat.size) return reject(new Error('[pdfSignerService convertDocxToPdf] Đọc không đủ byte từ tệp nguồn.'));
+      } finally { try { fs.closeSync(fd); } catch (cErr) { console.warn('[pdfSignerService] Lỗi đóng fd:', cErr.message); } }
+    } catch (openErr) { return reject(new Error('[pdfSignerService convertDocxToPdf] Lỗi mở tệp: ' + openErr.message)); }
+    let isolatedTmpDir;
+    try {
+      isolatedTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'edusign_conv_'));
+    } catch (tmpErr) { return reject(new Error('[pdfSignerService convertDocxToPdf] Lỗi tạo thư mục tạm: ' + tmpErr.message)); }
+    const uniqueName = `doc_${crypto.randomUUID()}`;
+    const stagedDocx = path.join(isolatedTmpDir, `${uniqueName}${ext}`); const stagedPdf = path.join(isolatedTmpDir, `${uniqueName}.pdf`);
+    const cleanupTemp = () => { try { if (fs.existsSync(isolatedTmpDir)) fs.rmSync(isolatedTmpDir, { recursive: true, force: true }); } catch (cErr) { console.warn('[pdfSignerService] Lỗi dọn tạm:', cErr.message); } };
+    // Ghi an toàn bản sao độc quyền (wx) vào thư mục tạm cô lập
+    // ============================================================================
+    try {
+      fs.writeFileSync(stagedDocx, sourceBuffer, { mode: 0o600, flag: 'wx' });
+    } catch (writeErr) {
+      cleanupTemp();
+      return reject(new Error(`[pdfSignerService convertDocxToPdf] Không thể ghi bản sao tạm tệp Word: ${writeErr.message}`));
     }
 
+    // Môi trường phi Windows (Linux / Container)
     if (process.platform !== 'win32') {
-      // Môi trường Linux (như Render Cloud)
-      // Thử dùng soffice hoặc libreoffice nếu có
-      const { exec } = require('child_process');
-      const outDir = path.dirname(absPdf);
-      exec(`soffice --headless --convert-to pdf --outdir "${outDir}" "${absDocx}" || libreoffice --headless --convert-to pdf --outdir "${outDir}" "${absDocx}"`, { timeout: 45000 }, (err) => {
-        const expectedPdf = path.join(outDir, path.basename(absDocx, path.extname(absDocx)) + '.pdf');
-        if (fs.existsSync(expectedPdf) && fs.statSync(expectedPdf).size > 100) {
-          if (expectedPdf !== absPdf) {
-            try { fs.copyFileSync(expectedPdf, absPdf); fs.unlinkSync(expectedPdf); } catch (e) { void e; }
-          }
-          return resolve(absPdf);
+      const args = ['--headless', '--convert-to', 'pdf', '--outdir', isolatedTmpDir, stagedDocx];
+      execFile('soffice', args, { timeout: 45000 }, (soErr) => {
+        if (soErr) {
+          execFile('libreoffice', args, { timeout: 45000 }, (loErr) => {
+            if (loErr) {
+              cleanupTemp();
+              return reject(new Error('Máy chủ Linux Cloud (Render) không có Word COM hoặc LibreOffice. Hệ thống sẽ tự động chuyển đổi trực tiếp trên trình duyệt.'));
+            }
+            finishConversion();
+          });
+          return;
         }
-        return reject(new Error('Máy chủ Linux Cloud (Render) không có Word COM hoặc LibreOffice. Hệ thống sẽ tự động chuyển đổi trực tiếp trên trình duyệt.'));
+        finishConversion();
       });
+
+      function finishConversion() {
+        if (!fs.existsSync(stagedPdf)) {
+          cleanupTemp();
+          return reject(new Error('[pdfSignerService convertDocxToPdf] Tiến trình LibreOffice không tạo được file PDF đầu ra.'));
+        }
+        safelyCommitPdfOutput(stagedPdf, absPdf, allowedRoots)
+          .then((finalPdf) => {
+            cleanupTemp();
+            resolve(finalPdf);
+          })
+          .catch((postErr) => {
+            cleanupTemp();
+            reject(new Error(`[pdfSignerService convertDocxToPdf] Lỗi hoàn tất file PDF: ${postErr.message}`));
+          });
+      }
       return;
     }
 
-    const os = require('os');
-    const tmpDir = os.tmpdir();
-    const uniqueId = `conv_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
-    const ext = path.extname(absDocx).toLowerCase() === '.doc' ? '.doc' : '.docx';
-    const stagedDocx = path.join(tmpDir, `${uniqueId}${ext}`);
-    const stagedPdf = path.join(tmpDir, `${uniqueId}.pdf`);
-    const tempPs1 = path.join(tmpDir, `${uniqueId}.ps1`);
-
-    try {
-      fs.copyFileSync(absDocx, stagedDocx);
-    } catch (copyInErr) {
-      return reject(new Error(`Không thể sao chép tệp Word sang thư mục tạm: ${copyInErr.message}`));
-    }
-
+    // Môi trường Windows: Sử dụng PowerShell gọi Word COM
+    const tempPs1 = path.join(isolatedTmpDir, `${uniqueName}.ps1`);
     const script = '\uFEFF' + [
       `$w = New-Object -ComObject Word.Application`,
       `$w.Visible = $false`,
@@ -76,80 +298,85 @@ function convertDocxToPdf(docxPath, outputPath) {
       `}`
     ].join('\r\n');
 
-    fs.writeFileSync(tempPs1, script, 'utf8');
-
-    const { execFile } = require('child_process');
+    try {
+      fs.writeFileSync(tempPs1, script, 'utf8');
+    } catch (psWriteErr) {
+      cleanupTemp();
+      return reject(new Error(`[pdfSignerService convertDocxToPdf] Không thể tạo script chuyển đổi: ${psWriteErr.message}`));
+    }
     execFile('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', tempPs1], { timeout: 45000 }, (error, stdout, stderr) => {
-      try { if (fs.existsSync(tempPs1)) fs.unlinkSync(tempPs1); } catch (e) { void e; }
-      try { if (fs.existsSync(stagedDocx)) fs.unlinkSync(stagedDocx); } catch (e) { void e; }
-
-      const absPdf = path.resolve(outputPath);
-      if (fs.existsSync(stagedPdf) && fs.statSync(stagedPdf).size > 100) {
-        try {
-          const outDir = path.dirname(absPdf);
-          if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
-          fs.copyFileSync(stagedPdf, absPdf);
-          try { fs.unlinkSync(stagedPdf); } catch (e) { void e; }
-          resolve(absPdf);
-        } catch (copyOutErr) {
-          try { if (fs.existsSync(stagedPdf)) fs.unlinkSync(stagedPdf); } catch (e) { void e; }
-          reject(new Error(`Không thể lưu file PDF sau chuyển đổi: ${copyOutErr.message}`));
-        }
-      } else {
-        try { if (fs.existsSync(stagedPdf)) fs.unlinkSync(stagedPdf); } catch (e) { void e; }
-        reject(new Error('Chuyển đổi Word sang PDF không thành công: ' + (stderr || error?.message || 'File PDF đầu ra rỗng hoặc không tạo được')));
+      if (error || !fs.existsSync(stagedPdf)) {
+        const errMsg = stderr || error?.message || 'File PDF đầu ra không được tạo.';
+        cleanupTemp();
+        return reject(new Error(`Chuyển đổi Word sang PDF không thành công: ${errMsg}`));
       }
+      safelyCommitPdfOutput(stagedPdf, absPdf, allowedRoots)
+        .then((finalPdf) => { cleanupTemp(); resolve(finalPdf); })
+        .catch((commitErr) => { cleanupTemp(); reject(new Error('Không thể lưu PDF: ' + commitErr.message)); });
     });
   });
 }
 
+function isImageMagic(b) {
+  if (!b || b.length < 8) return false;
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return true;
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return true;
+  return b.length >= 12 && b.subarray(0, 4).toString('ascii') === 'RIFF' && b.subarray(8, 12).toString('ascii') === 'WEBP';
+}
 /**
- * Chuyển đổi linh hoạt dữ liệu ảnh (Base64 data URI, file path đĩa, web URL) thành Buffer
+ * Chuyển đổi dữ liệu ảnh (Base64 URI hoặc tệp trong uploads/public) thành Buffer.
+ * Chống Path Traversal, loại bỏ __dirname, validate Base64/Magic bytes và chống TOCTOU fd.
  */
 function resolveImageBuffer(imgDataOrPath) {
   if (!imgDataOrPath) return null;
-  if (typeof imgDataOrPath === 'string') {
-    if (imgDataOrPath.includes('base64')) {
-      try {
-        const base64Clean = imgDataOrPath.replace(/^data:image\/\w+;base64,/, '');
-        return Buffer.from(base64Clean, 'base64');
-      } catch (e) {
-        return null;
-      }
-    }
-    // Xử lý đường dẫn web hoặc đường dẫn file cục bộ
-    let candidatePath = imgDataOrPath;
-    if (candidatePath.startsWith('/uploads/') || candidatePath.startsWith('uploads/')) {
-      candidatePath = path.join(__dirname, candidatePath.replace(/^\//, ''));
-    } else if (!path.isAbsolute(candidatePath)) {
-      candidatePath = path.join(__dirname, candidatePath);
-    }
-    if (fs.existsSync(candidatePath)) {
-      try {
-        return fs.readFileSync(candidatePath);
-      } catch (e) {
-        return null;
-      }
-    }
+  if (Buffer.isBuffer(imgDataOrPath)) return (imgDataOrPath.length <= 10 * 1024 * 1024 && isImageMagic(imgDataOrPath)) ? imgDataOrPath : null;
+  if (typeof imgDataOrPath !== 'string') return null;
+  const b64 = imgDataOrPath.match(/^data:image\/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=\s]+)$/);
+  if (b64) {
+    const raw = b64[2].replace(/\s/g, '');
+    if (raw.length > 15 * 1024 * 1024) return null;
+    try { const buf = Buffer.from(raw, 'base64'); return (buf.length <= 10 * 1024 * 1024 && isImageMagic(buf)) ? buf : null; } catch (e) { return null; }
   }
-  return null;
+  let candidate = imgDataOrPath.trim();
+  if (candidate.startsWith('/uploads/') || candidate.startsWith('uploads/')) candidate = path.join(__dirname, 'uploads', candidate.replace(/^\/?uploads\/?/, ''));
+  else if (candidate.startsWith('/public/') || candidate.startsWith('public/')) candidate = path.join(__dirname, 'public', candidate.replace(/^\/?public\/?/, ''));
+  else if (!path.isAbsolute(candidate)) candidate = path.resolve(__dirname, 'uploads', candidate);
+  let fd = null;
+  try {
+    const absPath = path.resolve(candidate);
+    const realFile = fs.realpathSync(absPath);
+    verifyNoSymlinkInPath(absPath);
+    const allowed = [path.resolve(__dirname, 'uploads'), path.resolve(__dirname, 'public')];
+    const canonicalRoots = allowed.map((r) => { try { return fs.realpathSync(r); } catch (e) { return null; } }).filter(Boolean);
+    const isContained = canonicalRoots.some((r) => { const rel = path.relative(r, realFile); return !rel.startsWith('..') && !path.isAbsolute(rel); });
+    if (!isContained) return null;
+    fd = fs.openSync(realFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size === 0 || stat.size > 10 * 1024 * 1024) { fs.closeSync(fd); return null; }
+    const buf = fs.readFileSync(fd);
+    fs.closeSync(fd); fd = null;
+    return isImageMagic(buf) ? buf : null;
+  } catch (err) { if (fd !== null) { try { fs.closeSync(fd); } catch (e) { /* ignore */ } } return null; }
 }
 
 /**
  * Kiểm tra tính toàn vẹn của tệp PNG (IDAT chunks) trước khi đưa vào UPNG của pdf-lib
- * Ngăn chặn triệt để lỗ hổng DoS treo cứng máy chủ (infinite loop / ReDoS) khi gặp ảnh PNG hỏng hoặc cắt cụt.
+ * Ngăn chặn DoS ReDoS và Zip Bomb với giới hạn IDAT 10MB và maxOutputLength 20MB.
  */
 function isSafePng(buf) {
-  if (!buf || buf.length < 8) return false;
+  if (!buf || !Buffer.isBuffer(buf) || buf.length < 8 || buf.length > 10 * 1024 * 1024) return false;
   if (buf[0] !== 0x89 || buf[1] !== 0x50 || buf[2] !== 0x4e || buf[3] !== 0x47) return false;
   try {
     let offset = 8;
+    let totalIdat = 0;
     const idatChunks = [];
     while (offset + 8 <= buf.length) {
       const len = buf.readUInt32BE(offset);
       const type = buf.toString('ascii', offset + 4, offset + 8);
       if (offset + 12 + len > buf.length) return false;
       if (type === 'IDAT') {
+        totalIdat += len;
+        if (totalIdat > 10 * 1024 * 1024) return false;
         idatChunks.push(buf.slice(offset + 8, offset + 8 + len));
       }
       offset += 12 + len;
@@ -157,18 +384,16 @@ function isSafePng(buf) {
     if (idatChunks.length === 0) return false;
     const allIdat = Buffer.concat(idatChunks);
     const zlib = require('zlib');
-    zlib.inflateSync(allIdat);
+    zlib.inflateSync(allIdat, { maxOutputLength: 20 * 1024 * 1024 });
     return true;
-  } catch (e) {
-    return false;
-  }
+  } catch (e) { return false; }
 }
 
 /**
- * Nhúng ảnh (PNG hoặc JPG) an toàn vào tài liệu PDF
+ * Nhúng ảnh (PNG hoặc JPG) an toàn vào tài liệu PDF với giới hạn kích thước 10MB
  */
 async function embedImageToPdf(pdfDoc, imgBuffer) {
-  if (!imgBuffer || imgBuffer.length === 0) return null;
+  if (!pdfDoc || !imgBuffer || !Buffer.isBuffer(imgBuffer) || imgBuffer.length === 0 || imgBuffer.length > 10 * 1024 * 1024) return null;
   try {
     if (isSafePng(imgBuffer)) {
       return await pdfDoc.embedPng(imgBuffer);
@@ -185,67 +410,66 @@ async function embedImageToPdf(pdfDoc, imgBuffer) {
 }
 
 const { resolveFilePath } = require('./dataStore');
-
 /**
  * Đóng dấu ảnh chữ ký & chứng nhận điện tử vào tệp PDF
  */
 async function generateSignedPdf(doc) {
+  if (!doc || typeof doc !== 'object') throw new TypeError('[generateSignedPdf] doc không hợp lệ.');
   let sourcePdfBuffer = null;
-
   // 0. Nếu đã có dữ liệu PDF ký số thật dạng Base64 lưu trong doc, ưu tiên dùng
   if (doc.signedPdfBase64 && typeof doc.signedPdfBase64 === 'string') {
     try {
-      const cleanSignedB64 = doc.signedPdfBase64.replace(/^data:[^;]+;base64,/, '');
-      const buf = Buffer.from(cleanSignedB64, 'base64');
-      if (buf.length > 50 && buf.toString('ascii', 0, 5).startsWith('%PDF')) {
-        sourcePdfBuffer = buf;
+      const cleanSignedB64 = (doc.signedPdfBase64 || '').replace(/^data:[^;]+;base64,/, '');
+      if (cleanSignedB64.length <= 50 * 1024 * 1024 && /^[A-Za-z0-9+/=\s]+$/.test(cleanSignedB64)) {
+        const buf = Buffer.from(cleanSignedB64, 'base64');
+        if (buf.length > 50 && buf.length <= 35 * 1024 * 1024 && buf.toString('ascii', 0, 5).startsWith('%PDF')) sourcePdfBuffer = buf;
       }
-    } catch (e) { void e; }
+    } catch (e) { console.warn('[generateSignedPdf] Cảnh báo nạp signedPdfBase64:', e.message); }
   }
 
-  // 1. Đọc file nguồn từ fileBase64 nếu có
+  // 1. Đọc file nguồn từ fileBase64 nếu có (giới hạn 35MB và xác thực magic bytes Word/PDF)
   if (!sourcePdfBuffer && doc.fileBase64 && typeof doc.fileBase64 === 'string') {
     try {
       const cleanB64 = doc.fileBase64.replace(/^data:[^;]+;base64,/, '');
-      const buf = Buffer.from(cleanB64, 'base64');
-      if (buf.length > 50 && buf.toString('ascii', 0, 5).startsWith('%PDF')) {
-        sourcePdfBuffer = buf;
-      } else if (buf.length > 50 && (doc.fileName || '').match(/\.(docx|doc)$/i)) {
-        try {
-          const os = require('os');
-          const isDoc = (doc.fileName || '').toLowerCase().endsWith('.doc');
-          const ext = isDoc ? '.doc' : '.docx';
-          const tempDocx = path.join(os.tmpdir(), `temp_conv_${Date.now()}_${Math.floor(Math.random()*1000)}${ext}`);
-          const tempPdf = tempDocx.replace(/\.[^.]+$/, '.pdf');
-          fs.writeFileSync(tempDocx, buf);
-          await convertDocxToPdf(tempDocx, tempPdf);
-          if (fs.existsSync(tempPdf) && fs.statSync(tempPdf).size > 100) {
-            sourcePdfBuffer = fs.readFileSync(tempPdf);
-          }
-          try { if (fs.existsSync(tempDocx)) fs.unlinkSync(tempDocx); } catch (e) { void e; }
-          try { if (fs.existsSync(tempPdf)) fs.unlinkSync(tempPdf); } catch (e) { void e; }
-        } catch (convErr) {
-          console.warn('Word COM conversion note:', convErr.message);
-          if (doc.onlyConvert) {
-            throw convErr;
+      if (cleanB64.length <= 50 * 1024 * 1024 && /^[A-Za-z0-9+/=\s]+$/.test(cleanB64)) {
+        const buf = Buffer.from(cleanB64, 'base64'); if (buf.length > 50 && buf.length <= 35 * 1024 * 1024) {
+          if (buf.toString('ascii', 0, 5).startsWith('%PDF')) sourcePdfBuffer = buf;
+          else if ((doc.fileName || '').match(/\.(docx|doc)$/i)) {
+            const isWord = (buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) || (buf[0] === 0xd0 && buf[1] === 0xcf && buf[2] === 0x11 && buf[3] === 0xe0);
+            if (isWord) {
+              let tempDir = null; try {
+                const os = require('os');
+                tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cva_conv_'));
+                const ext = (doc.fileName || '').toLowerCase().endsWith('.doc') ? '.doc' : '.docx';
+                const tempDocx = path.join(tempDir, `input${ext}`);
+                const tempPdf = path.join(tempDir, 'output.pdf');
+                fs.writeFileSync(tempDocx, buf, { flag: 'wx' }); await convertDocxToPdf(tempDocx, tempPdf);
+                const pStat = fs.existsSync(tempPdf) ? fs.statSync(tempPdf) : null;
+                if (pStat && pStat.size > 100 && pStat.size <= 35 * 1024 * 1024) {
+                  const cBuf = fs.readFileSync(tempPdf); if (cBuf.toString('ascii', 0, 5).startsWith('%PDF')) sourcePdfBuffer = cBuf;
+                }
+              } catch (convErr) {
+                console.warn('Word COM conversion note:', convErr.message); if (doc.onlyConvert) throw convErr;
+              } finally {
+                if (tempDir) { try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (e) { void e; } }
+              }
+            }
           }
         }
       }
-    } catch (err) {
-      console.error('Lỗi đọc fileBase64 trong generateSignedPdf:', err.message);
-      if (doc.onlyConvert) {
-        throw err;
-      }
-    }
+    } catch (err) { console.error('Lỗi đọc fileBase64 trong generateSignedPdf:', err.message); if (doc.onlyConvert) throw err; }
   }
 
   // 2. Đọc file nguồn từ realSignedPath nếu có (hỗ trợ cả Windows và Linux)
   if (!sourcePdfBuffer && doc.realSignedPath) {
-    const resolvedSigned = resolveFilePath(doc.realSignedPath);
-    if (resolvedSigned && fs.existsSync(resolvedSigned)) {
+    const res = resolveFilePath(doc.realSignedPath);
+    if (res && fs.existsSync(res)) {
       try {
-        sourcePdfBuffer = fs.readFileSync(resolvedSigned);
-      } catch (e) { void e; }
+        const st = fs.statSync(res);
+        if (st.isFile() && st.size > 50 && st.size <= 35 * 1024 * 1024) {
+          const sBuf = fs.readFileSync(res); if (sBuf.toString('ascii', 0, 5).startsWith('%PDF')) sourcePdfBuffer = sBuf;
+        }
+      } catch (e) { console.warn('[generateSignedPdf] Cảnh báo đọc realSignedPath:', e.message); }
     }
   }
 
@@ -256,25 +480,31 @@ async function generateSignedPdf(doc) {
       const ext = path.extname(resolvedPath).toLowerCase();
       if (ext === '.pdf') {
         try {
-          sourcePdfBuffer = fs.readFileSync(resolvedPath);
-        } catch (err) {
-          console.error('Lỗi đọc file gốc:', err.message);
-        }
+          const s = fs.statSync(resolvedPath);
+          if (!s.isFile() || s.size < 50 || s.size > 35 * 1024 * 1024) throw new Error('Kích thước PDF không hợp lệ.');
+          const b = fs.readFileSync(resolvedPath);
+          if (!b.toString('ascii', 0, 5).startsWith('%PDF')) throw new Error('Tệp không đúng định dạng PDF.');
+          sourcePdfBuffer = b;
+        } catch (err) { throw new Error(`[generateSignedPdf] Lỗi đọc file gốc PDF: ${err.message}`); }
       } else if (ext === '.docx' || ext === '.doc') {
+        let tempDir = null;
         try {
-          const convertedPdfPath = resolvedPath.replace(/\.[^.]+$/, '.pdf');
-          if (fs.existsSync(convertedPdfPath) && fs.statSync(convertedPdfPath).size > 100) {
-            sourcePdfBuffer = fs.readFileSync(convertedPdfPath);
-          } else {
-            await convertDocxToPdf(resolvedPath, convertedPdfPath);
-            if (fs.existsSync(convertedPdfPath)) {
-              sourcePdfBuffer = fs.readFileSync(convertedPdfPath);
-            }
+          tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cva_wconv_'));
+          const tempPdf = path.join(tempDir, 'output.pdf');
+          await convertDocxToPdf(resolvedPath, tempPdf);
+          const st = fs.existsSync(tempPdf) ? fs.statSync(tempPdf) : null;
+          if (!st || !st.isFile() || st.size < 50 || st.size > 35 * 1024 * 1024) {
+            throw new Error('Kích thước PDF sau chuyển đổi không hợp lệ.');
           }
+          const b = fs.readFileSync(tempPdf);
+          if (!b.toString('ascii', 0, 5).startsWith('%PDF')) throw new Error('PDF thiếu magic bytes %PDF.');
+          sourcePdfBuffer = b;
         } catch (e) {
-          console.error('Lỗi chuyển đổi Word sang PDF khi ký:', e.message);
-          if (doc.onlyConvert) {
-            throw e;
+          throw new Error(`[generateSignedPdf] Lỗi chuyển đổi Word sang PDF khi ký: ${e.message}`);
+        } finally {
+          if (tempDir) {
+            try { fs.rmSync(tempDir, { recursive: true, force: true }); }
+            catch (rmErr) { console.warn('[generateSignedPdf] Không thể dọn thư mục tạm:', rmErr.message); }
           }
         }
       }
@@ -283,32 +513,26 @@ async function generateSignedPdf(doc) {
 
   // Nếu chỉ yêu cầu chuyển đổi định dạng (chưa ký, chưa đóng dấu ảnh), trả về trực tiếp file PDF
   if (doc.onlyConvert) {
-    if (sourcePdfBuffer && sourcePdfBuffer.length > 50) {
-      return sourcePdfBuffer;
-    }
+    if (sourcePdfBuffer && sourcePdfBuffer.length > 50) return sourcePdfBuffer;
     throw new Error('Chuyển đổi Word sang PDF không thành công, vui lòng kiểm tra tệp Word.');
   }
 
   // Nếu tài liệu đã được đóng dấu ảnh từ trước (isPreStamped), không đóng dấu lặp lại
-  if (doc.isPreStamped && sourcePdfBuffer && sourcePdfBuffer.length > 50) {
-    return sourcePdfBuffer;
-  }
+  if (doc.isPreStamped && sourcePdfBuffer && sourcePdfBuffer.length > 50) return sourcePdfBuffer;
 
-  // BẢO VỆ CHỮ KÝ SỐ ĐÃ CÓ TRƯỚC (NHƯ CỦA CÔ PHẠM THỊ MỸ HẰNG):
-  // Nếu tệp PDF đã có chữ ký số điện tử (chứa /ByteRange hoặc /Type /Sig),
-  // tuyệt đối KHÔNG cho pdf-lib load() và save() vẽ đè lên trang vì sẽ phá vỡ dải băm SHA-256 của chữ ký trước!
-  // Tệp được giữ nguyên vẹn 100% byte để iText ký nối tiếp (Append Mode / Incremental Update).
+  // Bảo vệ chữ ký số đã có trước: Dò marker trên Buffer, giữ nguyên cho ký nối tiếp
   if (sourcePdfBuffer && sourcePdfBuffer.length > 50) {
-    const sourcePdfString = sourcePdfBuffer.toString('binary');
-    const hasExistingSig = sourcePdfString.includes('/ByteRange') || sourcePdfString.includes('/Type /Sig') || sourcePdfString.includes('/Type/Sig');
-    if (hasExistingSig) {
-      console.log(`[Signature Preservation] 🛡️ Phát hiện tệp PDF đã có chữ ký số hợp lệ trước đó (của cô Phạm Thị Mỹ Hằng). Giữ nguyên 100% byte gốc để tránh làm hỏng chữ ký của người ký trước.`);
-      return sourcePdfBuffer;
+    const hasSig = sourcePdfBuffer.includes('/ByteRange') || sourcePdfBuffer.includes('/Type /Sig') || sourcePdfBuffer.includes('/Type/Sig');
+    if (hasSig) {
+      console.log('[Signature Preservation] 🛡️ Phát hiện tệp PDF có chữ ký số; giữ buffer làm đầu vào cho ký nối tiếp.');
+      if (doc.preserveExistingOnly === true) return sourcePdfBuffer;
     }
   }
 
-  // Nếu không có file PDF nguồn (hoặc file lỗi, rỗng), tạo tài liệu PDF chuẩn xác thực cho chính hồ sơ này
+  // Không fallback sang PDF rỗng nếu đã chỉ định nguồn tệp nhưng không đọc được
+  const hasSpecifiedSource = !!(doc.signedPdfBase64 || doc.fileBase64 || doc.realSignedPath || doc.filePath);
   if (!sourcePdfBuffer || sourcePdfBuffer.length < 50 || !sourcePdfBuffer.toString('ascii', 0, 5).startsWith('%PDF')) {
+    if (hasSpecifiedSource) throw new Error('[generateSignedPdf] Tài liệu nguồn được cung cấp không hợp lệ hoặc bị lỗi.');
     const newEmptyDoc = await PDFDocument.create();
     const page = newEmptyDoc.addPage([595.28, 841.89]); // Khổ chuẩn A4 (595 x 842 pt)
     const helveticaBold = await newEmptyDoc.embedFont(StandardFonts.HelveticaBold);
@@ -355,37 +579,37 @@ async function generateSignedPdf(doc) {
     if (isCopySign) {
       const copyType = doc.copyType || 'SAO Y';
       const signerName = (doc.signatures && doc.signatures[0] && doc.signatures[0].signerName) || doc.author || 'Hà Văn Tý';
-      const nowIso = new Date().toISOString().replace('Z', '+07:00');
+      const nowIso = new Date().toISOString();
       const copyText = doc.copyText || `${copyType}; ${signerName}; Thời gian ký: ${nowIso}`;
-
       const firstPage = sourcePages[0];
       const { width: p1W, height: p1H } = firstPage.getSize();
-
       // 1. Nếu có ảnh banner PNG từ client (Canvas 300 DPI hiển thị tiếng Việt hoàn hảo)
       let bannerDrawn = false;
       const bannerB64 = doc.copySignBannerBase64 || doc.copyBannerBase64;
-      if (bannerB64 && typeof bannerB64 === 'string') {
+      if (bannerB64 && typeof bannerB64 === 'string' && bannerB64.length <= 15 * 1024 * 1024) {
         try {
           const rawB64 = bannerB64.replace(/^data:[^;]+;base64,/, '');
-          const bannerBuf = Buffer.from(rawB64, 'base64');
-          if (bannerBuf.length > 50) {
-            const bannerPng = await pdfDoc.embedPng(bannerBuf);
-            const wPt = (doc.copySignBannerWidthPt && doc.copySignBannerWidthPt > 10) 
-              ? doc.copySignBannerWidthPt 
-              : Math.round(bannerPng.width / 3.0);
-            const hPt = (doc.copySignBannerHeightPt && doc.copySignBannerHeightPt > 5) 
-              ? doc.copySignBannerHeightPt 
-              : Math.round(bannerPng.height / 3.0);
-            const textX = p1W - wPt - 40;
-            const textY = p1H - hPt - 18;
-            firstPage.drawImage(bannerPng, {
-              x: textX,
-              y: textY,
-              width: wPt,
-              height: hPt
-            });
-            bannerDrawn = true;
-            console.log(`[Copy Sign] 📋 Đã nhúng ảnh chữ ký Sao y chuẩn Canvas PNG tại Trang 1 (${textX.toFixed(1)}, ${textY.toFixed(1)}, W=${wPt}, H=${hPt}): "${copyText}"`);
+          if (/^[A-Za-z0-9+/=\s]+$/.test(rawB64)) {
+            const bannerBuf = Buffer.from(rawB64, 'base64');
+            if (bannerBuf.length >= 50 && bannerBuf.length <= 10 * 1024 * 1024 && isSafePng(bannerBuf)) {
+              const bannerPng = await pdfDoc.embedPng(bannerBuf);
+              const rawW = Number(doc.copySignBannerWidthPt);
+              const rawH = Number(doc.copySignBannerHeightPt);
+              const defW = Math.min(Math.round(bannerPng.width / 3.0), p1W - 80);
+              const defH = Math.min(Math.round(bannerPng.height / 3.0), p1H - 80);
+              const wPt = (Number.isFinite(rawW) && rawW >= 10 && rawW <= p1W - 40) ? rawW : defW;
+              const hPt = (Number.isFinite(rawH) && rawH >= 5 && rawH <= p1H - 40) ? rawH : defH;
+              const textX = p1W - wPt - 40;
+              const textY = p1H - hPt - 18;
+              firstPage.drawImage(bannerPng, {
+                x: textX,
+                y: textY,
+                width: wPt,
+                height: hPt
+              });
+              bannerDrawn = true;
+              console.log(`[Copy Sign] 📋 Đã nhúng ảnh chữ ký Sao y chuẩn Canvas PNG tại Trang 1 (${textX.toFixed(1)}, ${textY.toFixed(1)}, W=${wPt}, H=${hPt}): "${copyText}"`);
+            }
           }
         } catch (bannerErr) {
           console.warn('[Copy Sign] Lỗi nhúng ảnh banner PNG:', bannerErr.message);
@@ -685,104 +909,103 @@ async function findSmartSignatureAnchor(pdfBufferOrPath, signerName = 'Hà Văn 
  * Hỗ trợ chuyển đổi mượt mà giữa máy tính Windows cục bộ và máy chủ đám mây Linux Render / Docker
  */
 async function signWithRealVgca(doc) {
+  if (!doc || typeof doc !== 'object') throw new TypeError('[signWithRealVgca] Dữ liệu tài liệu không hợp lệ.');
   // 1. Tạo file PDF đã đóng dấu ảnh chữ ký chuẩn
   const stampedPdfBuffer = await generateSignedPdf(doc);
   const tempDir = path.join(__dirname, 'uploads', 'documents');
   if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
 
-  const tempInput = path.join(tempDir, `temp_stamped_${doc.id}_${Date.now()}.pdf`);
-  const tempOutput = path.join(tempDir, `RealSigned_${doc.id}_${Date.now()}.pdf`);
-  fs.writeFileSync(tempInput, stampedPdfBuffer);
+  const safeId = String(doc.id || 'doc').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 50);
+  const randSuffix = require('crypto').randomBytes(8).toString('hex');
+  const tempInput = path.join(tempDir, `temp_stamped_${safeId}_${randSuffix}.pdf`);
+  const tempOutput = path.join(tempDir, `RealSigned_${safeId}_${randSuffix}.pdf`);
+  await fs.promises.writeFile(tempInput, stampedPdfBuffer);
 
-  // 2. Tìm công cụ ký số RealPdfSigner
-  const runner = findSignerRunner();
+  try {
+    // 2. Tìm công cụ ký số RealPdfSigner
+    const runner = findSignerRunner();
+    if (runner) {
+      const rawScale = Number(doc.signCoordinates && doc.signCoordinates.scale);
+      const scale = (Number.isFinite(rawScale) && rawScale > 0) ? Math.min(rawScale, 10) : 1.0;
+      const w = Math.round(90 * scale), h = Math.round(60 * scale);
+      const rawSigner = (doc.signatures && doc.signatures[0] && doc.signatures[0].signerName) || doc.author || 'Hà Văn Tý';
+      const cleanSigner = String(rawSigner).replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, 100);
+      const signerName = cleanSigner.length > 0 ? cleanSigner : 'Hà Văn Tý';
+      const defaultSig = path.join(__dirname, 'uploads', 'signatures', 'sig_user_cvaty.png');
+      const sigImgPath = fs.existsSync(defaultSig) ? defaultSig : '';
 
-  if (runner) {
-    // Tọa độ đã chuẩn hóa
-    const scale = (doc.signCoordinates && doc.signCoordinates.scale) || 1.0;
-    const w = Math.round(90 * scale);
-    const h = Math.round(60 * scale);
+      try {
+        const isTestEnv = !!(process.env.NODE_ENV === 'test' || process.env.TEST_PORT);
+        const signTimeout = isTestEnv ? 4000 : 35000;
 
-    const signerName = (doc.signatures && doc.signatures[0] && doc.signatures[0].signerName) || doc.author || 'Hà Văn Tý';
-    const sigImgPath = path.join(__dirname, 'uploads', 'signatures', 'sig_user_cvaty.png');
+        const result = await new Promise((resolve, reject) => {
+          const { execFile } = require('child_process');
+          const isCopy = (doc.signType === 'COPY' || doc.isCopySign === true);
+          const cliArgs = isCopy ? [
+            ...runner.argsPrefix,
+            '--copy-sign',
+            tempInput,
+            tempOutput,
+            doc.copyType || 'SAO Y',
+            signerName
+          ] : [
+            ...runner.argsPrefix,
+            '--sign',
+            tempInput,
+            tempOutput,
+            '0',
+            '-1',
+            '-1',
+            String(w),
+            String(h),
+            `${signerName} đã ký số VGCA`,
+            'Quảng Ngãi',
+            sigImgPath
+          ];
+          execFile(runner.command, cliArgs, { timeout: signTimeout }, (error, stdout, stderr) => {
+            if (error) {
+              console.warn('[VGCA Signer] C# Runner gặp lỗi hoặc môi trường không có CSP:', stderr || error.message);
+              return reject(error);
+            }
 
-    try {
-      const isTestEnv = !!(process.env.NODE_ENV === 'test' || process.env.TEST_PORT);
-      const signTimeout = isTestEnv ? 4000 : 35000;
-
-      const result = await new Promise((resolve, reject) => {
-        const { execFile } = require('child_process');
-        const isCopy = (doc.signType === 'COPY' || doc.isCopySign === true);
-        const cliArgs = isCopy ? [
-          ...runner.argsPrefix,
-          '--copy-sign',
-          tempInput,
-          tempOutput,
-          doc.copyType || 'SAO Y',
-          signerName
-        ] : [
-          ...runner.argsPrefix,
-          '--sign',
-          tempInput,
-          tempOutput,
-          '0',
-          '-1',
-          '-1',
-          String(w),
-          String(h),
-          `${signerName} đã ký số VGCA`,
-          'Quảng Ngãi',
-          sigImgPath
-        ];
-        execFile(runner.command, cliArgs, { timeout: signTimeout }, (error, stdout, stderr) => {
-          if (error) {
-            console.warn('[VGCA Signer] C# Runner gặp lỗi hoặc môi trường không có CSP:', stderr || error.message);
-            return reject(error);
-          }
-
-          if (fs.existsSync(tempOutput) && fs.statSync(tempOutput).size > 100) {
-            const signedBuf = fs.readFileSync(tempOutput);
-            resolve({
-              signedBuffer: signedBuf,
-              signedFilePath: tempOutput,
-              isRealSigned: true,
-              stdout
-            });
-          } else {
-            reject(new Error('Chưa tạo được tệp kết quả sau khi ký số'));
-          }
+            if (fs.existsSync(tempOutput) && fs.statSync(tempOutput).size > 100) {
+              const signedBuf = fs.readFileSync(tempOutput);
+              resolve({
+                signedBuffer: signedBuf,
+                signedFilePath: tempOutput,
+                isRealSigned: true,
+                stdout
+              });
+            } else {
+              reject(new Error('Chưa tạo được tệp kết quả sau khi ký số'));
+            }
+          });
         });
-      });
-
-      // Dọn dẹp file trung gian
-      try { if (fs.existsSync(tempInput)) fs.unlinkSync(tempInput); } catch (e) { void e; }
-      return result;
-    } catch (err) {
-      console.error('[VGCA Engine] C# Runner thất bại:', err.message);
-      // Dọn dẹp trước khi throw
-      try { if (fs.existsSync(tempInput)) fs.unlinkSync(tempInput); } catch (e) { void e; }
-      // === Fix F: KHÔNG fallback sang ký giả — throw lỗi rõ ràng ===
-      throw new Error(
-        `Ký số thất bại: ${err.message}\n` +
-        `Vui lòng kiểm tra:\n` +
-        `1. EduSign Agent đang chạy (biểu tượng khiên xanh ở khay hệ thống)\n` +
-        `2. Thiết bị USB Token đã cắm vào máy tính\n` +
-        `3. Virtual CSP (vgca_vcsp_v2_mgr.exe) đang hoạt động`
-      );
+        return result;
+      } catch (err) {
+        console.error('[VGCA Engine] C# Runner thất bại:', err.message);
+        try { if (fs.existsSync(tempOutput)) fs.unlinkSync(tempOutput); } catch (rmOutErr) { console.warn('[VGCA Signer] Lỗi dọn output tạm:', rmOutErr.message); }
+        throw new Error(
+          `Ký số thất bại: ${err.message}\n` +
+          `Vui lòng kiểm tra:\n` +
+          `1. EduSign Agent đang chạy (biểu tượng khiên xanh ở khay hệ thống)\n` +
+          `2. Thiết bị USB Token đã cắm vào máy tính\n` +
+          `3. Virtual CSP (vgca_vcsp_v2_mgr.exe) đang hoạt động`
+        );
+      }
     }
+
+    throw new Error(
+      'EduSign Agent chưa được cài đặt hoặc chưa chạy trên máy tính này.\n' +
+      'Chữ ký số pháp lý VGCA yêu cầu EduSign Agent phải hoạt động cục bộ.\n' +
+      'Vui lòng:\n' +
+      '1. Tải và cài đặt EduSign Agent từ trang web\n' +
+      '2. Chạy EduSign_Agent.exe → biểu tượng khiên xanh xuất hiện ở khay hệ thống\n' +
+      '3. Thực hiện ký số lại'
+    );
+  } finally {
+    try { if (fs.existsSync(tempInput)) fs.unlinkSync(tempInput); } catch (cleanErr) { console.warn('[VGCA Signer] Lỗi dọn tệp input tạm:', cleanErr.message); }
   }
-
-  // === Fix F: Không có Agent → KHÔNG được ký giả — trả lỗi rõ ràng ===
-  try { if (fs.existsSync(tempInput)) fs.unlinkSync(tempInput); } catch (e) { void e; }
-
-  throw new Error(
-    'EduSign Agent chưa được cài đặt hoặc chưa chạy trên máy tính này.\n' +
-    'Chữ ký số pháp lý VGCA yêu cầu EduSign Agent phải hoạt động cục bộ.\n' +
-    'Vui lòng:\n' +
-    '1. Tải và cài đặt EduSign Agent từ trang web\n' +
-    '2. Chạy EduSign_Agent.exe → biểu tượng khiên xanh xuất hiện ở khay hệ thống\n' +
-    '3. Thực hiện ký số lại'
-  );
 }
 
 module.exports = {

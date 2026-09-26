@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-09-25T17:00:28.185Z",
+  "isAuditing": false,
+  "status": "REJECTED",
+  "file": "tests/verify_view_signed_document.js",
+  "sliceIndex": 2,
+  "totalSlices": 3,
+  "startLine": 61,
+  "endLine": 120,
+  "sliceLabel": "tests/verify_view_signed_document.js [Dòng 61 - 120 / Tổng 160 dòng]",
+  "totalIssues": 1,
+  "issues": [
+    {
+      "slice": "tests/verify_view_signed_document.js [Dòng 61 - 120 / Tổng 160 dòng]",
+      "file": "tests/verify_view_signed_document.js",
+      "line": "117",
+      "severity": "MEDIUM",
+      "issue": "Bài kiểm thử phụ thuộc vào thời gian chờ cố định `1500ms`, gây flaky test khi ứng dụng tải chậm, CI quá tải hoặc API phản hồi trễ.",
+      "reproductionScenario": "`networkidle` hoàn tất nhưng dữ liệu/view “signed document” chưa render xong trong 1.500ms. Các bước kiểm tra tiếp theo không tìm thấy phần tử hoặc trạng thái cần xác minh, khiến test thất bại không ổn định dù ứng dụng hoạt động đúng.",
+      "requiredFix": "Thay `await page.waitForTimeout(1500)` bằng chờ điều kiện nghiệp vụ cụ thể, chẳng hạn `await expect(page.locator(...)).toBeVisible({ timeout: 10000 })` hoặc chờ response/API tương ứng. Chỉ dùng timeout cố định làm fallback tối thiểu khi không thể xác định được tín hiệu hoàn tất."
+    }
+  ],
+  "detail": "Phát hiện 1 vi phạm tại tests/verify_view_signed_document.js (Dòng 117)"
+}

@@ -28,15 +28,54 @@
 // ====================================================================================================
 // 🌟 1. CẤU HÌNH HỆ THỐNG TOÀN DIỆN
 // ====================================================================================================
+/**
+ * Lấy Token Zalo Bot an toàn từ Script Properties (hoặc biến môi trường), triệt tiêu rủi ro hard-code secret
+ */
+function getZaloBotToken() {
+  var token = "";
+  if (typeof PropertiesService !== "undefined" && PropertiesService.getScriptProperties) {
+    try {
+      var propToken = PropertiesService.getScriptProperties().getProperty("ZALO_BOT_TOKEN");
+      if (propToken && propToken.trim()) {
+        token = propToken.trim();
+      }
+    } catch (err) {
+      var message = err instanceof Error ? err.message : String(err);
+      if (typeof Logger !== "undefined" && Logger.log) {
+        Logger.log("⚠️ Không thể đọc ZALO_BOT_TOKEN từ PropertiesService: " + message);
+      } else {
+        console.error("⚠️ Không thể đọc ZALO_BOT_TOKEN từ PropertiesService:", message);
+      }
+    }
+  }
+  if (!token && typeof process !== "undefined" && process.env && process.env.ZALO_BOT_TOKEN) {
+    token = process.env.ZALO_BOT_TOKEN.trim();
+  }
+  if (!token) {
+    var warnMsg = "⚠️ ZALO_BOT_TOKEN chưa được cấu hình trong Script Properties (hoặc biến môi trường)!";
+    if (typeof Logger !== "undefined" && Logger.log) {
+      Logger.log(warnMsg);
+    } else {
+      console.warn(warnMsg);
+    }
+  }
+  return token;
+}
+
 var CONFIG = {
-  // Token Zalo Bot Platform (Cấp từ Zalo Platform Developer)
-  ZALO_BOT_TOKEN: "2294655560219778902:jzfmNEYGuXlSvmyKEYeCrbSWIKGrmumxQhoSsFXkgNBXsnOaWWDwTjSYqjoAdaqp",
+  // Token Zalo Bot Platform (Đọc động bảo mật từ Script Properties, cấm hard-code)
+  get ZALO_BOT_TOKEN() {
+    return getZaloBotToken();
+  },
   
   // ID file Google Sheets làm cơ sở dữ liệu
   SPREADSHEET_ID: "1Y0HQ2Pi-XvtgmOuPqQK-H8Ay5lzVUCh9uzd54Czll2I", 
   
   // URL Web App Google Apps Script công khai đã duyệt quyền Anyone
   WEB_APP_URL: "https://script.google.com/macros/s/AKfycbwGBgauc9xHzRe31_IfCQD-Q9yHwGp4CfYLEam9IupcYhLpNBXbgW0J1t-weD6iUQ87ZQ/exec",
+
+  // Khóa bí mật đồng bộ bảo mật Webhook hệ thống (Mặc định hoặc cấu hình qua Script Properties)
+  WEBHOOK_SECRET: "UnifiedZaloBotTHCSCVA2026Secret",
 
   // Tên trường & Cổng thông tin trực tuyến
   SCHOOL_NAME: "TRƯỜNG THCS CHU VĂN AN",
@@ -85,25 +124,37 @@ var CONFIG = {
 // 🔧 2. KHỞI TẠO TỰ ĐỘNG BẢNG TÍNH & CƠ SỞ DỮ LIỆU
 // ====================================================================================================
 function initSheetsIfMissing() {
-  var ss;
-  if (CONFIG.SPREADSHEET_ID && CONFIG.SPREADSHEET_ID.trim() !== "") {
-    try {
-      ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID.trim());
-    } catch (e) {
-      Logger.log("⚠️ Không mở được Sheet với ID đã cấu hình. Đang tạo Sheet mới...");
-    }
+  var configuredId =
+    typeof CONFIG !== "undefined" &&
+    CONFIG &&
+    typeof CONFIG.SPREADSHEET_ID === "string"
+      ? CONFIG.SPREADSHEET_ID.trim()
+      : "";
+  if (!configuredId) {
+    var missMsg = "❌ CONFIG.SPREADSHEET_ID chưa được cấu hình. Vui lòng thiết lập ID Google Sheet hợp lệ trước khi khởi tạo!";
+    Logger.log(missMsg);
+    throw new Error(missMsg);
   }
-
-  if (!ss) {
-    ss = SpreadsheetApp.create("EduSign_DuLieu_KYS_THCS_ChuVanAn");
-    Logger.log("✅ ĐÃ TẠO GOOGLE SHEET MỚI THÀNH CÔNG! ID: " + ss.getId());
-    Logger.log("👉 Hãy copy ID này dán vào mục CONFIG.SPREADSHEET_ID: " + ss.getId());
+  var ss;
+  try {
+    ss = SpreadsheetApp.openById(configuredId);
+  } catch (e) {
+    var errMsg = "❌ Không thể mở Google Sheet với SPREADSHEET_ID đã cấu hình [" + configuredId + "]: " + (e && e.message ? e.message : String(e));
+    Logger.log(errMsg);
+    throw new Error(errMsg);
   }
 
   // 1. Khởi tạo Sheet "Danh bạ GV" (Dùng map SĐT -> Zalo Chat ID & TKB ShortName)
-  var sheetUsers = ss.getSheetByName(CONFIG.SHEET_USERS);
+  var sheetUsersName =
+    typeof CONFIG !== "undefined" &&
+    CONFIG &&
+    typeof CONFIG.SHEET_USERS === "string" &&
+    CONFIG.SHEET_USERS.trim() !== ""
+      ? CONFIG.SHEET_USERS.trim()
+      : "Danh bạ GV";
+  var sheetUsers = ss.getSheetByName(sheetUsersName);
   if (!sheetUsers) {
-    sheetUsers = ss.insertSheet(CONFIG.SHEET_USERS);
+    sheetUsers = ss.insertSheet(sheetUsersName);
     sheetUsers.getRange(1, 1, 1, 9).setValues([[
       "STT", "Họ và Tên", "Số Điện Thoại", "Tổ Chuyên Môn", "Email Công Vụ", "Zalo_Chat_ID", "Ngày Liên Kết", "Tên_Viết_Tắt_TKB", "Mã PIN"
     ]]);
@@ -115,13 +166,9 @@ function initSheetsIfMissing() {
       sheetUsers.getRange("C:C").setNumberFormat("@");
       sheetUsers.getRange("F:F").setNumberFormat("@");
       sheetUsers.getRange("I:I").setNumberFormat("@");
-    } catch (eFmt) {}
-
-    // Thêm dữ liệu mẫu danh bạ với tiền tố ' bắt buộc
-    sheetUsers.appendRow([1, "Ban Giám hiệu", "'02553850001", "Ban Giám hiệu", "bgh-dakha@quangngai.gov.vn", "", "", "BGH", "'0001"]);
-    sheetUsers.appendRow([2, "Ngô Thị Liền", "'0905123456", "Ban Giám hiệu", "cva.lien@quangngai.gov.vn", "", "", "Liền", "'3456"]);
-    sheetUsers.appendRow([3, "Hà Văn Tý", "'0912345678", "Tổ Toán - Tin", "cva.ty@thcschuvanan.edu.vn", "", "", "Tý", "'0007"]);
-    sheetUsers.appendRow([4, "Trần Văn Nam", "'0987654321", "Tổ Toán - Tin", "tvnam@thcschuvanan.edu.vn", "", "", "Nam", "'4321"]);
+    } catch (eFmt) {
+      Logger.log("⚠️ Cảnh báo thiết lập format Text: " + (eFmt && eFmt.message ? eFmt.message : String(eFmt)));
+    }
   } else {
     // Tự động kiểm tra và thêm tiêu đề cột 9 "Mã PIN" nếu bảng hiện tại chưa có
     try {
@@ -135,13 +182,23 @@ function initSheetsIfMissing() {
       sheetUsers.getRange("C:C").setNumberFormat("@");
       sheetUsers.getRange("F:F").setNumberFormat("@");
       sheetUsers.getRange("I:I").setNumberFormat("@");
-    } catch (eH) {}
+    } catch (eH) {
+      Logger.log("⚠️ Lỗi kiểm tra tiêu đề và định dạng cột sheetUsers: " + (eH && eH.message ? eH.message : String(eH)));
+      throw new Error("Lỗi cập nhật cấu trúc bảng danh bạ người dùng: " + (eH && eH.message ? eH.message : String(eH)));
+    }
   }
 
   // 2. Khởi tạo Sheet "Sổ Lưu Báo Cáo"
-  var sheetReports = ss.getSheetByName(CONFIG.SHEET_REPORTS);
+  var sheetReportsName =
+    typeof CONFIG !== "undefined" &&
+    CONFIG &&
+    typeof CONFIG.SHEET_REPORTS === "string" &&
+    CONFIG.SHEET_REPORTS.trim() !== ""
+      ? CONFIG.SHEET_REPORTS.trim()
+      : "Sổ Lưu Báo Cáo";
+  var sheetReports = ss.getSheetByName(sheetReportsName);
   if (!sheetReports) {
-    sheetReports = ss.insertSheet(CONFIG.SHEET_REPORTS);
+    sheetReports = ss.insertSheet(sheetReportsName);
     sheetReports.getRange(1, 1, 1, 11).setValues([[
       "Mã Hồ Sơ", "Tiêu Đề Báo Cáo", "Tác GiẢ", "Số Điện Thoại", "Tổ Chuyên Môn",
       "Người Ký BGH", "Ngày Ký Duyệt", "Trạng Thái", "Link Xem Drive", "Link Tải", "Ghi Chú"
@@ -156,58 +213,133 @@ function initSheetsIfMissing() {
 
 function getDatabaseSpreadsheet() {
   if (typeof SpreadsheetApp === "undefined") return null;
-  if (CONFIG.SPREADSHEET_ID && CONFIG.SPREADSHEET_ID.trim() !== "") {
+  var configuredId =
+    typeof CONFIG !== "undefined" &&
+    CONFIG &&
+    typeof CONFIG.SPREADSHEET_ID === "string"
+      ? CONFIG.SPREADSHEET_ID.trim()
+      : "";
+  if (!configuredId) {
+    var missErr = "❌ CONFIG.SPREADSHEET_ID chưa được cấu hình. Vui lòng thiết lập ID Google Sheet hợp lệ!";
+    Logger.log(missErr);
+    throw new Error(missErr);
+  }
+  try {
+    return SpreadsheetApp.openById(configuredId);
+  } catch (e) {
+    var openErr = "❌ Không thể mở Google Sheet với SPREADSHEET_ID đã cấu hình [" + configuredId + "]: " + (e && e.message ? e.message : String(e));
+    Logger.log(openErr);
+    throw new Error(openErr);
+  }
+}
+
+/**
+ * Lấy Secret Token bảo vệ Zalo Webhook an toàn từ Script Properties
+ */
+function getZaloWebhookSecret() {
+  var secret = "";
+  if (typeof PropertiesService !== "undefined" && PropertiesService.getScriptProperties) {
     try {
-      return SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID.trim());
-    } catch (e) {
-      Logger.log("Lỗi mở spreadsheet ID: " + e.message);
+      var propSecret = PropertiesService.getScriptProperties().getProperty("ZALO_WEBHOOK_SECRET");
+      if (propSecret && propSecret.trim()) {
+        secret = propSecret.trim();
+      }
+    } catch (err) {
+      var message = err instanceof Error ? err.message : String(err);
+      if (typeof Logger !== "undefined" && Logger.log) {
+        Logger.log("⚠️ Không thể đọc ZALO_WEBHOOK_SECRET từ PropertiesService: " + message);
+      }
     }
   }
-  if (typeof DriveApp !== "undefined") {
-    var files = DriveApp.getFilesByName("EduSign_DuLieu_KYS_THCS_ChuVanAn");
-    if (files.hasNext()) {
-      return SpreadsheetApp.open(files.next());
-    }
+  if (!secret && typeof process !== "undefined" && process.env && process.env.ZALO_WEBHOOK_SECRET) {
+    secret = process.env.ZALO_WEBHOOK_SECRET.trim();
   }
-  var newId = initSheetsIfMissing();
-  return SpreadsheetApp.openById(newId);
+  return secret;
 }
 
 // ====================================================================================================
 // 🚀 3. ĐĂNG KÝ WEBHOOK CHO ZALO BOT (Chạy 1 lần trong Apps Script)
 // ====================================================================================================
 function setZaloBotWebhook(customUrl) {
-  if (!CONFIG.ZALO_BOT_TOKEN) {
-    Logger.log("❌ Vui lòng điền CONFIG.ZALO_BOT_TOKEN!");
-    return;
+  var botToken =
+    typeof CONFIG !== "undefined" &&
+    CONFIG &&
+    typeof CONFIG.ZALO_BOT_TOKEN === "string"
+      ? CONFIG.ZALO_BOT_TOKEN.trim()
+      : "";
+
+  if (!botToken) {
+    var tokenErr = "❌ Vui lòng điền cấu hình ZALO_BOT_TOKEN trong Script Properties hoặc CONFIG!";
+    Logger.log(tokenErr);
+    return { success: false, reason: "MISSING_ZALO_BOT_TOKEN" };
   }
-  var webAppUrl = customUrl || (CONFIG.WEB_APP_URL && CONFIG.WEB_APP_URL.trim() !== "" ? CONFIG.WEB_APP_URL.trim() : "");
+
+  var configuredWebAppUrl =
+    typeof CONFIG !== "undefined" &&
+    CONFIG &&
+    typeof CONFIG.WEB_APP_URL === "string"
+      ? CONFIG.WEB_APP_URL.trim()
+      : "";
+  var webAppUrl = customUrl || (configuredWebAppUrl !== "" ? configuredWebAppUrl : "");
   if (!webAppUrl && typeof ScriptApp !== "undefined" && ScriptApp.getService) {
-    webAppUrl = ScriptApp.getService().getUrl();
+    try {
+      webAppUrl = ScriptApp.getService().getUrl() || "";
+    } catch (eUrl) {
+      webAppUrl = "";
+    }
   }
-  if (!webAppUrl) {
-    webAppUrl = "https://script.google.com/macros/s/AKfycbwGBgauc9xHzRe31_IfCQD-Q9yHwGp4CfYLEam9IupcYhLpNBXbgW0J1t-weD6iUQ87ZQ/exec";
+
+  if (!webAppUrl || typeof webAppUrl !== "string" || !webAppUrl.trim()) {
+    var missUrlErr = "❌ Không xác định được URL Web App hợp lệ. Vui lòng cung cấp customUrl hoặc cấu hình CONFIG.WEB_APP_URL!";
+    Logger.log(missUrlErr);
+    return { success: false, reason: "MISSING_WEB_APP_URL" };
   }
+
+  webAppUrl = webAppUrl.trim();
   // Chống lỗi dùng nhầm link /dev trong trình biên tập Apps Script
   if (webAppUrl.indexOf("/dev") !== -1) {
     webAppUrl = webAppUrl.replace(/\/dev(\?|$)/, "/exec$1");
   }
-  var apiUrl = "https://bot-api.zaloplatforms.com/bot" + CONFIG.ZALO_BOT_TOKEN + "/setWebhook";
+
+  // Kiểm tra định dạng URL HTTPS tương thích 100% Google Apps Script V8 (không dùng new URL() vì Apps Script không có class URL toàn cục)
+  if (!/^https:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=]+$/i.test(webAppUrl)) {
+    var parseErr = "❌ URL Web App bắt buộc sử dụng giao thức HTTPS và đúng định dạng: " + webAppUrl;
+    Logger.log(parseErr);
+    return { success: false, reason: "INVALID_WEB_APP_URL" };
+  }
+
+  var webhookSecret = getZaloWebhookSecret();
   var payload = {
-    url: webAppUrl,
-    secret_token: "UnifiedZaloBotTHCSCVA2026Secret"
+    url: webAppUrl
   };
+  if (webhookSecret) {
+    payload.secret_token = webhookSecret;
+  }
+
+  var apiUrl = "https://bot-api.zaloplatforms.com/bot" + botToken + "/setWebhook";
   var options = {
     method: "post",
     contentType: "application/json",
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
   };
+
   try {
     var response = UrlFetchApp.fetch(apiUrl, options);
-    Logger.log("✅ Kết quả đăng ký Webhook với URL: " + webAppUrl + " -> " + response.getContentText());
+    var statusCode = response ? (typeof response.getResponseCode === "function" ? response.getResponseCode() : 200) : 0;
+    var responseText = response ? (typeof response.getContentText === "function" ? response.getContentText() : "") : "";
+
+    if (statusCode >= 200 && statusCode < 300) {
+      Logger.log("✅ Đăng ký Webhook thành công với URL [" + webAppUrl + "]: " + responseText);
+      return { success: true, statusCode: statusCode, response: responseText };
+    } else {
+      Logger.log("❌ Đăng ký Webhook thất bại (HTTP " + statusCode + "): " + responseText);
+      return { success: false, statusCode: statusCode, error: responseText };
+    }
   } catch (err) {
-    Logger.log("❌ Lỗi khi đăng ký Webhook: " + err.toString());
+    var errMsg = "❌ Lỗi khi đăng ký Webhook: " + (err && err.message ? err.message : String(err));
+    Logger.log(errMsg);
+    return { success: false, error: errMsg };
   }
 }
 
@@ -280,6 +412,53 @@ function setupDailyMorningTrigger() {
 }
 
 /**
+ * Lấy chat ID nhóm bản tin sáng ưu tiên từ PropertiesService, fallback sang CONFIG
+ * @return {string}
+ */
+function getMorningBriefChatId() {
+  var chatId = "";
+  if (typeof PropertiesService !== "undefined" && PropertiesService.getScriptProperties) {
+    try {
+      chatId = PropertiesService.getScriptProperties().getProperty("MORNING_BRIEF_CHAT_ID") || "";
+    } catch (e) {
+      if (typeof Logger !== "undefined") {
+        Logger.log("Không thể đọc MORNING_BRIEF_CHAT_ID từ ScriptProperties: " + (e && e.message ? e.message : e));
+      }
+    }
+  }
+  if (!chatId && typeof CONFIG !== "undefined" && CONFIG && CONFIG.MORNING_BRIEF_CHAT_ID) {
+    chatId = CONFIG.MORNING_BRIEF_CHAT_ID;
+  }
+  return String(chatId || "").trim();
+}
+
+/**
+ * Xác thực API Key của Quản trị viên cho các tác vụ nhạy cảm
+ * @param {string} providedKey
+ * @return {boolean}
+ */
+function verifyAdminApiKey(providedKey) {
+  var expectedKey = "";
+  if (typeof PropertiesService !== "undefined" && PropertiesService.getScriptProperties) {
+    try {
+      expectedKey = PropertiesService.getScriptProperties().getProperty("ADMIN_API_KEY") || "";
+    } catch (e) {
+      if (typeof Logger !== "undefined") {
+        Logger.log("Không thể đọc ADMIN_API_KEY từ ScriptProperties: " + (e && e.message ? e.message : e));
+      }
+    }
+  }
+  if (!expectedKey && typeof process !== "undefined" && process && process.env) {
+    expectedKey = process.env.ADMIN_API_KEY || "";
+  }
+  if (!expectedKey && typeof CONFIG !== "undefined" && CONFIG && CONFIG.ADMIN_API_KEY) {
+    expectedKey = CONFIG.ADMIN_API_KEY;
+  }
+  if (!expectedKey) return false;
+  return typeof providedKey === "string" && providedKey.length > 0 && providedKey === expectedKey;
+}
+
+/**
  * Cấu hình tự động trigger gửi bản tin TKB tổng hợp toàn trường vào nhóm Zalo chung
  * Khung giờ thực thi: 06:00 - 07:00 sáng (mục tiêu ~06:30 AM)
  * Chỉ kích hoạt khi MORNING_BRIEF_CHAT_ID hoặc targetChatId được cấu hình
@@ -287,12 +466,28 @@ function setupDailyMorningTrigger() {
  * @return {object} - Trạng thái cấu hình trigger
  */
 function setupMorningBriefGroupTrigger(targetChatId) {
-  var chatId = targetChatId || CONFIG.MORNING_BRIEF_CHAT_ID;
-  if (!chatId || String(chatId).trim() === "") {
+  var configuredChatId = "";
+  if (typeof CONFIG !== "undefined" && CONFIG) {
+    configuredChatId = CONFIG.MORNING_BRIEF_CHAT_ID || "";
+  }
+  var resolvedId = targetChatId || getMorningBriefChatId() || configuredChatId || "";
+  var chatId = String(resolvedId).trim();
+  if (!chatId) {
     if (typeof Logger !== "undefined") {
       Logger.log("⚠️ Chưa cấu hình CONFIG.MORNING_BRIEF_CHAT_ID hoặc chat ID nhóm. Vui lòng cấu hình ID nhóm Zalo trường trước khi kích hoạt trigger này.");
     }
     return { success: false, error: "MISSING_GROUP_CHAT_ID" };
+  }
+
+  // Persist chatId vào PropertiesService để trigger nền độc lập có thể đọc chính xác
+  if (typeof PropertiesService !== "undefined" && PropertiesService.getScriptProperties) {
+    try {
+      PropertiesService.getScriptProperties().setProperty("MORNING_BRIEF_CHAT_ID", chatId);
+    } catch (e) {
+      if (typeof Logger !== "undefined") {
+        Logger.log("⚠️ Không thể lưu MORNING_BRIEF_CHAT_ID vào ScriptProperties: " + (e && e.message ? e.message : e));
+      }
+    }
   }
 
   if (typeof ScriptApp === "undefined" || !ScriptApp.newTrigger) {
@@ -327,57 +522,146 @@ function doGet(e) {
   // A. API phục vụ Cổng Tra Cứu Báo Cáo Độc Lập
   if (action === "GET_REPORTS" || action === "PORTAL_REPORTS") {
     try {
+      // Xác thực tùy chọn nếu hệ thống yêu cầu PORTAL_ACCESS_TOKEN
+      var configuredPortalToken = "";
+      if (typeof PropertiesService !== "undefined" && PropertiesService.getScriptProperties) {
+        try {
+          configuredPortalToken = PropertiesService.getScriptProperties().getProperty("PORTAL_ACCESS_TOKEN") || "";
+        } catch (e) {
+          if (typeof Logger !== "undefined") {
+            Logger.log("⚠️ Không thể đọc PORTAL_ACCESS_TOKEN từ ScriptProperties: " + (e && e.message ? e.message : e));
+          }
+          return ContentService.createTextOutput(JSON.stringify({
+            success: false,
+            error: "CONFIGURATION_ERROR"
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+      if (!configuredPortalToken && typeof CONFIG !== "undefined" && CONFIG && CONFIG.PORTAL_ACCESS_TOKEN) {
+        configuredPortalToken = CONFIG.PORTAL_ACCESS_TOKEN;
+      }
+      if (configuredPortalToken) {
+        // Kiểm tra khả năng hỗ trợ header của môi trường; nếu thiếu e.headers trả lỗi cấu hình rõ ràng
+        if (!e || !e.headers) {
+          return ContentService.createTextOutput(JSON.stringify({
+            success: false,
+            error: "CONFIGURATION_ERROR"
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+        var authHdr = e.headers["Authorization"] || e.headers["authorization"] || "";
+        var providedToken = (authHdr.indexOf("Bearer ") === 0) ? authHdr.substring(7).trim() : (e.headers["X-Portal-Token"] || e.headers["x-portal-token"] || "");
+        if (!providedToken || providedToken !== configuredPortalToken) {
+          return ContentService.createTextOutput(JSON.stringify({
+            success: false,
+            error: "UNAUTHORIZED_PORTAL_ACCESS"
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+
       var reports = fetchReportsFromSheet(params);
+      var schoolName = (typeof CONFIG !== "undefined" && CONFIG && CONFIG.SCHOOL_NAME) ? CONFIG.SCHOOL_NAME : "EduSign Portal";
       return ContentService.createTextOutput(JSON.stringify({
         success: true,
-        school: CONFIG.SCHOOL_NAME,
+        school: schoolName,
         total: reports.total,
         page: reports.page,
         limit: reports.limit,
         data: reports.data
       })).setMimeType(ContentService.MimeType.JSON);
     } catch (err) {
+      if (typeof Logger !== "undefined") Logger.log("⚠️ Lỗi truy vấn báo cáo trong doGet: " + (err && err.message ? err.message : err));
       return ContentService.createTextOutput(JSON.stringify({
         success: false,
-        error: err.toString()
+        error: "REPORTS_UNAVAILABLE"
       })).setMimeType(ContentService.MimeType.JSON);
     }
   }
 
   if (action === "DELETE_REPORT") {
-    try {
-      var delResult = deleteReportFromSheet(params.docId);
-      return ContentService.createTextOutput(JSON.stringify(delResult)).setMimeType(ContentService.MimeType.JSON);
-    } catch (err) {
+    // Kiểm tra khả năng hỗ trợ header của môi trường; cấm query param credential
+    if (!e || !e.headers) {
+      return ContentService.createTextOutput(JSON.stringify({ success: false, error: "METHOD_NOT_ALLOWED" })).setMimeType(ContentService.MimeType.JSON);
+    }
+    var reqAdminKey = ((e.headers["Authorization"] || e.headers["authorization"] || "").replace(/^Bearer\s+/i, "") || e.headers["X-Admin-Key"] || e.headers["x-admin-key"] || "").trim();
+    if (!reqAdminKey || !verifyAdminApiKey(reqAdminKey)) {
       return ContentService.createTextOutput(JSON.stringify({
         success: false,
-        error: err.toString()
+        error: "UNAUTHORIZED_ADMIN_ACTION"
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    try {
+      var delResult = deleteReportFromSheet(params.docId, reqAdminKey);
+      return ContentService.createTextOutput(JSON.stringify(delResult)).setMimeType(ContentService.MimeType.JSON);
+    } catch (err) {
+      if (typeof Logger !== "undefined") Logger.log("⚠️ Lỗi DELETE_REPORT: " + (err && err.message ? err.message : err));
+      return ContentService.createTextOutput(JSON.stringify({
+        success: false,
+        error: "OPERATION_FAILED"
       })).setMimeType(ContentService.MimeType.JSON);
     }
   }
 
   if (action === "BATCH_DELETE_REPORTS") {
+    if (!verifyAdminApiKey(params.adminKey || params.apiKey || params.key)) {
+      return ContentService.createTextOutput(JSON.stringify({
+        success: false,
+        error: "UNAUTHORIZED_ADMIN_ACTION"
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    var docIdsRaw = params.docIds;
+    var docIdsList = [];
+    if (Array.isArray(docIdsRaw)) {
+      docIdsList = docIdsRaw
+        .filter(function(id) { return typeof id === "string"; })
+        .map(function(id) { return id.trim(); })
+        .filter(Boolean);
+    } else if (typeof docIdsRaw === "string") {
+      docIdsList = docIdsRaw
+        .split(",")
+        .map(function(id) { return id.trim(); })
+        .filter(Boolean);
+    } else if (docIdsRaw != null) {
+      return ContentService.createTextOutput(JSON.stringify({
+        success: false,
+        error: "INVALID_DOC_IDS"
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (docIdsList.length === 0) {
+      return ContentService.createTextOutput(JSON.stringify({
+        success: false,
+        error: "EMPTY_DOC_IDS"
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
     try {
-      var docIdsRaw = params.docIds || "";
-      var docIdsList = Array.isArray(docIdsRaw) ? docIdsRaw : docIdsRaw.split(",").map(function(s) { return s.trim(); }).filter(Boolean);
       var batchResult = batchDeleteReportsFromSheet(docIdsList);
       return ContentService.createTextOutput(JSON.stringify(batchResult)).setMimeType(ContentService.MimeType.JSON);
     } catch (err) {
+      if (typeof Logger !== "undefined") Logger.log("⚠️ Lỗi BATCH_DELETE_REPORTS: " + (err && err.message ? err.message : err));
       return ContentService.createTextOutput(JSON.stringify({
         success: false,
-        error: err.toString()
+        error: "OPERATION_FAILED"
       })).setMimeType(ContentService.MimeType.JSON);
     }
   }
 
   if (action === "CLEAR_ALL_REPORTS") {
+    if (!verifyAdminApiKey(params.adminKey || params.apiKey || params.key)) {
+      return ContentService.createTextOutput(JSON.stringify({
+        success: false,
+        error: "UNAUTHORIZED_ADMIN_ACTION"
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
     try {
       var clearResult = clearAllReportsFromSheet();
       return ContentService.createTextOutput(JSON.stringify(clearResult)).setMimeType(ContentService.MimeType.JSON);
     } catch (err) {
+      if (typeof Logger !== "undefined") Logger.log("⚠️ Lỗi CLEAR_ALL_REPORTS: " + (err && err.message ? err.message : err));
       return ContentService.createTextOutput(JSON.stringify({
         success: false,
-        error: err.toString()
+        error: "OPERATION_FAILED"
       })).setMimeType(ContentService.MimeType.JSON);
     }
   }
@@ -387,24 +671,76 @@ function doGet(e) {
   var chatId = params.chat_id || params.chatId || "";
 
   if (action === "TEST_TOMORROW" || action === "TEST_SCHEDULE") {
-    var testPhone = params.phone || "0818810007";
-    var testResult = testSendTomorrowSchedule(testPhone);
-    return ContentService.createTextOutput(JSON.stringify(testResult, null, 2)).setMimeType(ContentService.MimeType.JSON);
+    if (!verifyAdminApiKey(params.adminKey || params.apiKey || params.key)) {
+      return ContentService.createTextOutput(JSON.stringify({
+        success: false,
+        error: "UNAUTHORIZED_ADMIN_ACTION"
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    var rawPhone = params.phone != null ? String(params.phone).trim() : "0818810007";
+    var phoneRegex = /^0\d{9}$/;
+    if (!phoneRegex.test(rawPhone)) {
+      return ContentService.createTextOutput(JSON.stringify({
+        success: false,
+        error: "INVALID_PHONE_NUMBER"
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    try {
+      var testResult = testSendTomorrowSchedule(rawPhone);
+      return ContentService.createTextOutput(JSON.stringify(testResult, null, 2)).setMimeType(ContentService.MimeType.JSON);
+    } catch (err) {
+      if (typeof Logger !== "undefined") Logger.log("⚠️ Lỗi TEST_TOMORROW: " + (err && err.message ? err.message : err));
+      return ContentService.createTextOutput(JSON.stringify({
+        success: false,
+        error: "OPERATION_FAILED"
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
   }
 
   if (query) {
-    var responseText = processUnifiedZaloMessage(chatId, query);
-    return ContentService.createTextOutput(responseText).setMimeType(ContentService.MimeType.TEXT);
+    try {
+      var responseText = processUnifiedZaloMessage(chatId, query);
+      return ContentService.createTextOutput(responseText).setMimeType(ContentService.MimeType.TEXT);
+    } catch (err) {
+      if (typeof Logger !== "undefined") Logger.log("⚠️ Lỗi processUnifiedZaloMessage: " + (err && err.message ? err.message : err));
+      return ContentService.createTextOutput("Xin lỗi, hệ thống đang bận. Vui lòng thử lại sau.").setMimeType(ContentService.MimeType.TEXT);
+    }
   }
 
   // C. Health Check
+  var healthSchoolName = (typeof CONFIG !== "undefined" && CONFIG && CONFIG.SCHOOL_NAME) ? CONFIG.SCHOOL_NAME : "EduSign Portal";
   return ContentService.createTextOutput(JSON.stringify({
     status: "active",
     system: "Unified Zalo Assistant 4.0 (Timetable + EduSign)",
-    school: CONFIG.SCHOOL_NAME,
+    school: healthSchoolName,
     timestamp: new Date().toISOString(),
     guide: "Webhook sẵn sàng phục vụ Tra cứu Thời khóa biểu và Ký số."
   })).setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * Lấy Webhook Secret dùng chung từ Script Properties hoặc process.env
+ * @return {string}
+ */
+function getSystemWebhookSecret() {
+  var secret = "";
+  if (typeof PropertiesService !== "undefined" && PropertiesService.getScriptProperties) {
+    try {
+      secret = PropertiesService.getScriptProperties().getProperty("WEBHOOK_SECRET") || "";
+    } catch (e) {
+      if (typeof Logger !== "undefined") {
+        Logger.log("⚠️ Không thể đọc WEBHOOK_SECRET từ PropertiesService: " + (e && e.message ? e.message : e));
+      }
+    }
+  }
+  if (!secret && typeof process !== "undefined" && process && process.env) {
+    secret = process.env.WEBHOOK_SECRET || "";
+  }
+  if (!secret && typeof CONFIG !== "undefined" && CONFIG && CONFIG.WEBHOOK_SECRET) {
+    secret = CONFIG.WEBHOOK_SECRET;
+  }
+  return String(secret || "").trim();
 }
 
 // ====================================================================================================
@@ -413,27 +749,57 @@ function doGet(e) {
 function doPost(e) {
   try {
     var postData = {};
-    if (e && e.postData && e.postData.contents) {
+    if (e && e.postData && typeof e.postData.contents === "string" && e.postData.contents.trim() !== "") {
       try {
-        postData = JSON.parse(e.postData.contents);
+        var parsed = JSON.parse(e.postData.contents);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          postData = parsed;
+        } else {
+          return ContentService.createTextOutput(JSON.stringify({
+            success: false,
+            error: "INVALID_JSON_PAYLOAD"
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
       } catch (err) {
-        postData = e.parameter || {};
+        if (typeof Logger !== "undefined") {
+          Logger.log("⚠️ Lỗi phân tích JSON payload trong doPost: " + (err && err.message ? err.message : err));
+        }
+        return ContentService.createTextOutput(JSON.stringify({
+          success: false,
+          error: "INVALID_JSON_PAYLOAD"
+        })).setMimeType(ContentService.MimeType.JSON);
       }
-    } else if (e && e.parameter) {
+    } else if (e && e.parameter && typeof e.parameter === "object" && !Array.isArray(e.parameter)) {
       postData = e.parameter;
+    }
+
+    if (!postData || typeof postData !== "object" || Array.isArray(postData)) {
+      postData = {};
     }
 
     var action = postData.action || "";
 
-    // Khắc phục DEFECT-ZALO-10: Kiểm tra chữ ký bảo mật Webhook Secret Token
-    var providedSecret = postData.secret_token || (e && e.parameter && e.parameter.secret_token) || "";
-    var SYSTEM_SECRET = "UnifiedZaloBotTHCSCVA2026Secret";
+    // Kiểm tra chữ ký bảo mật Webhook Secret Token từ cấu hình ScriptProperties/env (chỉ nhận từ payload POST body)
+    var providedSecret = String(postData.secret_token || "").trim();
+    var SYSTEM_SECRET = getSystemWebhookSecret();
 
     // Danh sách các hành động nhạy cảm bắt buộc phải có secret_token
-    var sensitiveActions = ["DELETE_REPORT", "BATCH_DELETE_REPORTS", "CLEAR_ALL_REPORTS", "NOTIFY_SIGN_EVENT", "SYNC_TEACHER", "SYNC_TEACHERS_BATCH"];
+    var sensitiveActions = [
+      "DELETE_REPORT",
+      "BATCH_DELETE_REPORTS",
+      "CLEAR_ALL_REPORTS",
+      "NOTIFY_SIGN_EVENT",
+      "SYNC_TEACHER",
+      "SYNC_TEACHERS_BATCH",
+      "UPLOAD_SIGNED_DOC",
+      "ARCHIVE_REPORT"
+    ];
+
     if (sensitiveActions.indexOf(action) !== -1) {
-      if (providedSecret !== SYSTEM_SECRET) {
-        Logger.log("⛔ Cảnh báo: Truy cập trái phép doPost không có secret_token hợp lệ!");
+      if (!SYSTEM_SECRET || !providedSecret || providedSecret !== SYSTEM_SECRET) {
+        if (typeof Logger !== "undefined") {
+          Logger.log("⛔ Cảnh báo: Truy cập trái phép doPost không có secret_token hợp lệ cho action: " + action);
+        }
         return ContentService.createTextOutput(JSON.stringify({ 
           success: false, 
           error: "UNAUTHORIZED_SECRET_TOKEN" 
@@ -465,21 +831,81 @@ function doPost(e) {
     }
 
     if (action === "DELETE_REPORT") {
-      var delDocId = postData.docId || (postData.parameter && postData.parameter.docId);
-      var delResult = deleteReportFromSheet(delDocId);
-      return ContentService.createTextOutput(JSON.stringify(delResult)).setMimeType(ContentService.MimeType.JSON);
+      var delDocId = String(
+        postData.docId ||
+        (postData.parameter && postData.parameter.docId) ||
+        ""
+      ).trim();
+
+      if (!delDocId) {
+        return ContentService.createTextOutput(JSON.stringify({
+          success: false,
+          error: "INVALID_DOC_ID"
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      try {
+        var delResult = deleteReportFromSheet(delDocId);
+        return ContentService.createTextOutput(JSON.stringify(delResult)).setMimeType(ContentService.MimeType.JSON);
+      } catch (err) {
+        if (typeof Logger !== "undefined") Logger.log("⚠️ Lỗi DELETE_REPORT trong doPost: " + (err && err.message ? err.message : err));
+        return ContentService.createTextOutput(JSON.stringify({
+          success: false,
+          error: "OPERATION_FAILED"
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
     }
 
     if (action === "BATCH_DELETE_REPORTS") {
       var docIds = postData.docIds || (postData.parameter && postData.parameter.docIds);
-      var docIdsList = Array.isArray(docIds) ? docIds : String(docIds || "").split(",").map(function(s) { return s.trim(); }).filter(Boolean);
-      var batchResult = batchDeleteReportsFromSheet(docIdsList);
-      return ContentService.createTextOutput(JSON.stringify(batchResult)).setMimeType(ContentService.MimeType.JSON);
+      var docIdsList = [];
+      if (Array.isArray(docIds)) {
+        docIdsList = docIds
+          .filter(function(id) { return typeof id === "string"; })
+          .map(function(id) { return id.trim(); })
+          .filter(Boolean);
+      } else if (typeof docIds === "string") {
+        docIdsList = docIds
+          .split(",")
+          .map(function(id) { return id.trim(); })
+          .filter(Boolean);
+      } else if (docIds != null) {
+        return ContentService.createTextOutput(JSON.stringify({
+          success: false,
+          error: "INVALID_DOC_IDS"
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      if (docIdsList.length === 0) {
+        return ContentService.createTextOutput(JSON.stringify({
+          success: false,
+          error: "EMPTY_DOC_IDS"
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      try {
+        var batchResult = batchDeleteReportsFromSheet(docIdsList);
+        return ContentService.createTextOutput(JSON.stringify(batchResult)).setMimeType(ContentService.MimeType.JSON);
+      } catch (err) {
+        if (typeof Logger !== "undefined") Logger.log("⚠️ Lỗi BATCH_DELETE_REPORTS trong doPost: " + (err && err.message ? err.message : err));
+        return ContentService.createTextOutput(JSON.stringify({
+          success: false,
+          error: "OPERATION_FAILED"
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
     }
 
     if (action === "CLEAR_ALL_REPORTS") {
-      var clearResult = clearAllReportsFromSheet();
-      return ContentService.createTextOutput(JSON.stringify(clearResult)).setMimeType(ContentService.MimeType.JSON);
+      try {
+        var clearResult = clearAllReportsFromSheet();
+        return ContentService.createTextOutput(JSON.stringify(clearResult)).setMimeType(ContentService.MimeType.JSON);
+      } catch (err) {
+        if (typeof Logger !== "undefined") Logger.log("⚠️ Lỗi CLEAR_ALL_REPORTS trong doPost: " + (err && err.message ? err.message : err));
+        return ContentService.createTextOutput(JSON.stringify({
+          success: false,
+          error: "OPERATION_FAILED"
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
     }
 
     // ----------------------------------------------------------------------------------
@@ -540,7 +966,10 @@ function doPost(e) {
     return ContentService.createTextOutput(JSON.stringify({ status: "ignored" })).setMimeType(ContentService.MimeType.JSON);
 
   } catch (err) {
-    return ContentService.createTextOutput(JSON.stringify({ status: "error", error: err.toString() })).setMimeType(ContentService.MimeType.JSON);
+    if (typeof Logger !== "undefined") {
+      Logger.log("⚠️ Lỗi doPost: " + (err && err.message ? err.message : err));
+    }
+    return ContentService.createTextOutput(JSON.stringify({ status: "error", error: "SERVER_ERROR" })).setMimeType(ContentService.MimeType.JSON);
   }
 }
 
@@ -548,7 +977,7 @@ function doPost(e) {
 // 🧠 7. BỘ ĐIỀU PHỐI TIN NHẮN THÔNG MINH HỢP NHẤT (UNIFIED NLP ROUTER)
 // ====================================================================================================
 function processUnifiedZaloMessage(chatId, rawText) {
-  var text = (rawText || "").trim();
+  var text = typeof rawText === "string" ? rawText.trim() : "";
   if (!text) return getUnifiedWelcomeGuideText();
 
   var clean = removeVietnameseTones(text).toLowerCase();
@@ -562,6 +991,7 @@ function processUnifiedZaloMessage(chatId, rawText) {
     if (chatId) {
       return handleSecurePhoneMapping(chatId, linkPattern[2].trim(), linkPattern[3].trim());
     }
+    return "⚠️ Thiếu định danh người dùng Zalo (chatId).";
   }
 
   // Nếu người dùng chỉ gõ trơ trọi số điện thoại, hướng dẫn bảo mật định danh
@@ -684,10 +1114,21 @@ function processUnifiedZaloMessage(chatId, rawText) {
 }
 
 function formatDateSafe(date, fmt) {
-  if (typeof Utilities !== "undefined" && Utilities.formatDate) {
-    return Utilities.formatDate(date, "Asia/Ho_Chi_Minh", fmt || "dd/MM/yyyy");
+  var d = date;
+  if (!d || !(d instanceof Date) || isNaN(d.getTime())) {
+    d = new Date();
   }
-  var d = date || new Date();
+
+  if (typeof Utilities !== "undefined" && Utilities.formatDate) {
+    try {
+      return Utilities.formatDate(d, "Asia/Ho_Chi_Minh", fmt || "dd/MM/yyyy");
+    } catch (e) {
+      if (typeof Logger !== "undefined") {
+        Logger.log("⚠️ Lỗi Utilities.formatDate: " + (e && e.message ? e.message : e));
+      }
+    }
+  }
+
   var day = String(d.getDate()).padStart(2, "0");
   var month = String(d.getMonth() + 1).padStart(2, "0");
   var year = d.getFullYear();
@@ -810,9 +1251,9 @@ function sendMorningBriefGroup() {
       return { status: "sunday_skip", message: "Sunday excluded gracefully" };
     }
 
-    var groupId = CONFIG.MORNING_BRIEF_CHAT_ID;
-    if (!groupId || String(groupId).trim() === "") {
-      if (typeof Logger !== "undefined") Logger.log("⚠️ CONFIG.MORNING_BRIEF_CHAT_ID để trống. Bỏ qua gửi bản tin nhóm.");
+    var groupId = getMorningBriefChatId();
+    if (!groupId) {
+      if (typeof Logger !== "undefined") Logger.log("⚠️ MORNING_BRIEF_CHAT_ID để trống. Bỏ qua gửi bản tin nhóm.");
       return { status: "skipped", message: "NO_GROUP_CHAT_ID" };
     }
 
@@ -854,47 +1295,57 @@ function sendMorningBriefGroup() {
  * @return {string|null} - Nội dung tin nhắn bản tin
  */
 function generateMorningSchoolBriefMessage(schoolData, dayKey, dayName, dateStr) {
-  if (!schoolData) return null;
+  if (!schoolData || typeof schoolData !== "object") return null;
 
-  var active = getActiveTimetable(schoolData);
-  var timetable = active.timetable || {};
-  var classes = schoolData.classes || [];
-  var substitutions = schoolData.substitutions || [];
+  var active = getActiveTimetable(schoolData) || {};
+  var timetable = (active && active.timetable && typeof active.timetable === "object") ? active.timetable : {};
+  var classes = Array.isArray(schoolData.classes) ? schoolData.classes : [];
+  var substitutions = Array.isArray(schoolData.substitutions) ? schoolData.substitutions : [];
 
   var morningClasses = [];
   var afternoonClasses = [];
 
   classes.forEach(function(c) {
-    var sess = (c.session || "sáng").toLowerCase();
-    var clsTkb = timetable[c.name];
+    if (!c || typeof c !== "object") return;
+    var sess = String(c.session || "sáng").toLowerCase();
+    var className = String(c.name || "").trim();
+    if (!className) return;
+
+    var clsTkb = timetable[className];
+    var daySchedule = (clsTkb && clsTkb[dayKey]) ? clsTkb[dayKey] : null;
     var hasTeaching = false;
-    if (clsTkb && clsTkb[dayKey]) {
+    if (daySchedule) {
       for (var p = 1; p <= 5; p++) {
-        if (clsTkb[dayKey][p] && clsTkb[dayKey][p].subject) {
+        if (daySchedule[p] && daySchedule[p].subject) {
           hasTeaching = true;
           break;
         }
       }
     }
     if (hasTeaching) {
-      if (sess === "sáng") morningClasses.push(c.name);
-      else afternoonClasses.push(c.name);
+      if (sess === "sáng") morningClasses.push(className);
+      else afternoonClasses.push(className);
     }
   });
 
   // Bóc tách ca dạy thay hôm nay
   var todaySubs = [];
   substitutions.forEach(function(s) {
-    if (!s) return;
+    if (!s || typeof s !== "object") return;
     var matches = true;
-    if (s.day && s.day !== dayKey) matches = false;
-    if (s.date && s.date !== "Hôm nay" && s.date !== dateStr) {
-      if (s.date.indexOf("/") !== -1 && s.date !== dateStr) matches = false;
+    var sDay = s.day != null ? String(s.day).trim() : "";
+    if (sDay && sDay !== dayKey) matches = false;
+
+    var sDate = typeof s.date === "string" ? s.date.trim() : (s.date != null ? String(s.date).trim() : "");
+    if (sDate && sDate !== "Hôm nay" && sDate !== dateStr) {
+      if (sDate.indexOf("/") !== -1 && sDate !== dateStr) matches = false;
     }
     if (matches) todaySubs.push(s);
   });
 
-  var schoolTitle = CONFIG.SCHOOL_NAME || "TRƯỜNG THCS CHU VĂN AN";
+  var schoolTitle = (typeof CONFIG !== "undefined" && CONFIG && typeof CONFIG.SCHOOL_NAME === "string" && CONFIG.SCHOOL_NAME.trim())
+    ? CONFIG.SCHOOL_NAME.trim()
+    : "TRƯỜNG THCS CHU VĂN AN";
   var msg = "🌅 BẢN TIN THỜI KHÓA BIỂU TOÀN TRƯỜNG (*" + dayName + "* - " + dateStr + ")\n" +
             "🏫 *" + schoolTitle.toUpperCase() + "*\n" +
             "Chúc quý Thầy/Cô một ngày giảng dạy thành công và hiệu quả! ✨\n\n" +
@@ -914,7 +1365,10 @@ function generateMorningSchoolBriefMessage(schoolData, dayKey, dayName, dateStr)
     msg += "\n🔄 DẠY THAY: ✨ Toàn trường thực hiện đúng TKB chính khóa, không có ca dạy thay.\n";
   }
 
-  msg += "\n🌐 Cổng TKB Online: " + CONFIG.PUBLIC_TKB_PORTAL + "\n" +
+  var portalUrl = (typeof CONFIG !== "undefined" && CONFIG && typeof CONFIG.PUBLIC_TKB_PORTAL === "string" && CONFIG.PUBLIC_TKB_PORTAL.trim())
+    ? CONFIG.PUBLIC_TKB_PORTAL.trim()
+    : "https://edusign.cva.edu.vn";
+  msg += "\n🌐 Cổng TKB Online: " + portalUrl + "\n" +
          "💡 Quý Thầy/Cô có thể gửi [Số Điện Thoại] hoặc gõ \"tkb [Tên GV]\" để tra cứu lịch riêng.";
 
   return msg;
@@ -924,26 +1378,37 @@ function generateMorningSchoolBriefMessage(schoolData, dayKey, dayName, dateStr)
  * Trình tạo nội dung tin nhắn chào buổi sáng tinh gọn kèm khung giờ chuẩn
  */
 function generateMorningTeacherMessage(teacher, schoolData, dayKey, dayName, dateStr) {
-  var active = getActiveTimetable(schoolData);
-  var timetable = active.timetable || {};
-  var classes = schoolData.classes || [];
-  var substitutions = schoolData.substitutions || [];
+  if (!teacher || typeof teacher !== "object" || !schoolData || typeof schoolData !== "object") return "";
+
+  var teacherShortName = String(teacher.shortName || "").trim();
+  var fullName = typeof teacher.fullName === "string" ? teacher.fullName.trim() : (teacher.fullName != null ? String(teacher.fullName).trim() : "");
+  if (!teacherShortName && !fullName) return "";
+
+  var active = getActiveTimetable(schoolData) || {};
+  var timetable = (active && active.timetable && typeof active.timetable === "object") ? active.timetable : {};
+  var classes = Array.isArray(schoolData.classes) ? schoolData.classes : [];
+  var substitutions = Array.isArray(schoolData.substitutions) ? schoolData.substitutions : [];
 
   var morningSlots = [];
   var afternoonSlots = [];
 
   // 1. Quét các tiết dạy chính khóa của giáo viên
   classes.forEach(function(c) {
-    var session = (c.session || "sáng").toLowerCase();
-    var clsTkb = timetable[c.name];
-    if (clsTkb && clsTkb[dayKey]) {
+    if (!c || typeof c !== "object") return;
+    var session = typeof c.session === "string" ? c.session.toLowerCase() : "sáng";
+    var className = String(c.name || "").trim();
+    if (!className) return;
+
+    var clsTkb = timetable[className];
+    var daySchedule = (clsTkb && clsTkb[dayKey]) ? clsTkb[dayKey] : null;
+    if (daySchedule) {
       for (var p = 1; p <= 5; p++) {
-        if (clsTkb[dayKey][p] && clsTkb[dayKey][p].teacher === teacher.shortName) {
+        if (daySchedule[p] && daySchedule[p].teacher === teacherShortName) {
           var timeStr = (formatPeriodTime(session, p) || "").replace(/\s+/g, "");
           var item = {
             period: p,
-            subject: clsTkb[dayKey][p].subject,
-            className: c.name,
+            subject: daySchedule[p].subject,
+            className: className,
             session: session,
             time: timeStr
           };
@@ -960,7 +1425,8 @@ function generateMorningTeacherMessage(teacher, schoolData, dayKey, dayName, dat
   // 2. Quét các ca dạy thay hôm nay (nếu có)
   var mySubs = [];
   substitutions.forEach(function(sub) {
-    if (sub && sub.substituteTeacher === teacher.shortName) {
+    if (!sub || typeof sub !== "object") return;
+    if (sub.substituteTeacher === teacherShortName) {
       mySubs.push(sub);
     }
   });
@@ -972,8 +1438,9 @@ function generateMorningTeacherMessage(teacher, schoolData, dayKey, dayName, dat
     return null; // Không gửi để tránh làm phiền giáo viên trong ngày nghỉ
   }
 
+  var displayName = fullName ? fullName : teacherShortName;
   var msg = "🌅 LỊCH GIẢNG DẠY HÔM NAY (*" + dayName + "* - " + dateStr + ")\n" +
-            "Kính chào Thầy/Cô *" + teacher.fullName.toUpperCase() + "*! ✨\n" +
+            "Kính chào Thầy/Cô *" + displayName.toUpperCase() + "*! ✨\n" +
             "Chúc Thầy/Cô một ngày làm việc hiệu quả.\n\n" +
             "📋 Hôm nay Thầy/Cô có " + totalPeriods + " tiết dạy:\n";
 
@@ -1042,27 +1509,50 @@ function formatDepartmentName(raw) {
     "g_nghe_thuat": "Tổ Âm nhạc - Mỹ thuật",
     "g_the_chat": "Tổ Giáo dục Thể chất"
   };
-  var lower = String(raw).trim().toLowerCase();
-  if (map[lower]) return map[lower];
-  return raw.replace(/^g_/, "Tổ ").replace(/_/g, " ");
+  var str = typeof raw === "string" ? raw.trim() : String(raw).trim();
+  var lower = str.toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(map, lower)) return map[lower];
+  return str.replace(/^g_/, "Tổ ").replace(/_/g, " ");
+}
+
+/**
+ * Thoát các ký tự định dạng Markdown đặc biệt cho Zalo (*, _, `, ~, [, ])
+ * @param {string} text
+ * @return {string}
+ */
+function escapeZaloMarkdown(text) {
+  if (!text) return "";
+  var str = typeof text === "string" ? text : String(text);
+  return str.replace(/([*_`~\[\]\\])/g, "\\$1");
 }
 
 // ====================================================================================================
 // 📊 10. TRÌNH ĐỊNH DẠNG THỜI KHÓA BIỂU KÈM KHUNG GIỜ (TỐI ƯU MÀN HÌNH ĐIỆN THOẠI)
 // ====================================================================================================
 function formatTeacherTimetableResponse(teacher, schoolData, dayFilter) {
-  var active = getActiveTimetable(schoolData);
-  var timetable = active.timetable || {};
-  var classes = schoolData.classes || [];
+  if (!teacher || typeof teacher !== "object") return "⚠️ Không tìm thấy thông tin giáo viên.";
+  if (!schoolData || typeof schoolData !== "object") return "⚠️ Dữ liệu thời khóa biểu hiện chưa khả dụng.";
+
+  var teacherShortName = String(teacher.shortName || "").trim();
+  var fullName = typeof teacher.fullName === "string" ? teacher.fullName.trim() : (teacher.fullName != null ? String(teacher.fullName).trim() : "");
+  var displayName = fullName ? fullName : teacherShortName;
+
+  var active = getActiveTimetable(schoolData) || {};
+  var timetable = (active && active.timetable && typeof active.timetable === "object") ? active.timetable : {};
+  var classes = Array.isArray(schoolData.classes) ? schoolData.classes : [];
   var weekdays = dayFilter ? [dayFilter] : ["T2", "T3", "T4", "T5", "T6", "T7"];
   var dayNames = { "T2": "Thứ Hai", "T3": "Thứ Ba", "T4": "Thứ Tư", "T5": "Thứ Năm", "T6": "Thứ Sáu", "T7": "Thứ Bảy" };
 
-  var out = "📅 LỊCH DẠY: *" + teacher.fullName.toUpperCase() + "* (" + teacher.shortName + ")\n";
+  var safeDisplayName = escapeZaloMarkdown(displayName.toUpperCase());
+  var safeShortName = escapeZaloMarkdown(teacherShortName);
+  var out = "📅 LỊCH DẠY: *" + safeDisplayName + "* (" + safeShortName + ")\n";
   if (teacher.group) {
-    out += "🏢 *" + formatDepartmentName(teacher.group) + "*\n";
+    out += "🏢 *" + escapeZaloMarkdown(formatDepartmentName(teacher.group)) + "*\n";
   }
   if (active.weekName) {
-    out += "📌 " + active.weekName + (active.applyDate ? " (từ " + active.applyDate + ")" : "") + "\n";
+    var safeWeekName = escapeZaloMarkdown(String(active.weekName));
+    var safeApplyDate = active.applyDate ? escapeZaloMarkdown(String(active.applyDate)) : "";
+    out += "📌 " + safeWeekName + (safeApplyDate ? " (từ " + safeApplyDate + ")" : "") + "\n";
   }
 
   var hasAnyPeriod = false;
@@ -1071,24 +1561,29 @@ function formatTeacherTimetableResponse(teacher, schoolData, dayFilter) {
     var daySlots = {};
 
     classes.forEach(function(c) {
-      var session = (c.session || "sáng").toLowerCase();
-      var clsTkb = timetable[c.name];
-      if (clsTkb && clsTkb[day]) {
+      if (!c || typeof c !== "object") return;
+      var session = typeof c.session === "string" ? c.session.toLowerCase() : "sáng";
+      var className = String(c.name || "").trim();
+      if (!className) return;
+
+      var clsTkb = (Object.prototype.hasOwnProperty.call(timetable, className) && timetable[className]) ? timetable[className] : null;
+      var daySchedule = (clsTkb && clsTkb[day]) ? clsTkb[day] : null;
+      if (daySchedule) {
         for (var p = 1; p <= 5; p++) {
-          if (clsTkb[day][p] && clsTkb[day][p].teacher === teacher.shortName) {
+          if (daySchedule[p] && daySchedule[p].teacher === teacherShortName) {
             var key = session + "_" + p;
             if (!daySlots[key]) {
               var timeStr = (formatPeriodTime(session, p) || "").replace(/\s+/g, "");
               daySlots[key] = {
                 p: p,
-                sub: clsTkb[day][p].subject,
-                classes: [c.name],
+                sub: daySchedule[p].subject,
+                classes: [className],
                 session: session,
                 time: timeStr
               };
             } else {
-              if (daySlots[key].classes.indexOf(c.name) === -1) {
-                daySlots[key].classes.push(c.name);
+              if (daySlots[key].classes.indexOf(className) === -1) {
+                daySlots[key].classes.push(className);
               }
             }
           }
@@ -1141,39 +1636,47 @@ function formatTeacherTimetableResponse(teacher, schoolData, dayFilter) {
     }
   }
 
-  out += "\n🌐 In TKB: " + CONFIG.PUBLIC_TKB_PORTAL + "?gv=" + encodeURIComponent(teacher.shortName);
+  var portalUrl = (CONFIG && CONFIG.PUBLIC_TKB_PORTAL) ? CONFIG.PUBLIC_TKB_PORTAL : "";
+  out += "\n🌐 In TKB: " + portalUrl + "?gv=" + encodeURIComponent((teacher && teacher.shortName) ? teacher.shortName : "");
   return out;
 }
 
 function formatClassTimetableResponse(cls, schoolData, dayFilter) {
-  var active = getActiveTimetable(schoolData);
-  var timetable = active.timetable || {};
-  var session = (cls.session || "sáng").toLowerCase();
+  if (!cls || typeof cls !== "object" || !schoolData || typeof schoolData !== "object") {
+    return "⚠️ Không tìm thấy dữ liệu lớp hoặc dữ liệu trường.";
+  }
+  var active = getActiveTimetable(schoolData) || {};
+  var timetable = (active && active.timetable && typeof active.timetable === "object") ? active.timetable : {};
+  var session = String(cls.session || "sáng").toLowerCase();
   var weekdays = dayFilter ? [dayFilter] : ["T2", "T3", "T4", "T5", "T6", "T7"];
   var dayNames = { "T2": "Thứ Hai", "T3": "Thứ Ba", "T4": "Thứ Tư", "T5": "Thứ Năm", "T6": "Thứ Sáu", "T7": "Thứ Bảy" };
 
   var gvcnInfo = getHomeroomTeacher(cls, timetable, schoolData.assignments, schoolData.teachers);
 
-  var out = "🏫 TKB LỚP *" + cls.name + "* (*" + (session === "chiều" ? "Buổi Chiều" : "Buổi Sáng") + "*)\n";
+  var clsDisplayName = escapeZaloMarkdown(String(cls.name || "").trim());
+  var out = "🏫 TKB LỚP *" + clsDisplayName + "* (*" + (session === "chiều" ? "Buổi Chiều" : "Buổi Sáng") + "*)\n";
   if (gvcnInfo) {
-    out += "👨‍🏫 GVCN: *" + gvcnInfo + "*\n";
+    out += "👨‍🏫 GVCN: *" + escapeZaloMarkdown(String(gvcnInfo)) + "*\n";
   }
   if (active.weekName) {
-    out += "📌 " + active.weekName + (active.applyDate ? " (từ " + active.applyDate + ")" : "") + "\n";
+    out += "📌 " + escapeZaloMarkdown(String(active.weekName)) + (active.applyDate ? " (từ " + escapeZaloMarkdown(String(active.applyDate)) + ")" : "") + "\n";
   }
 
   var hasSlots = false;
-  var clsSchedule = timetable[cls.name] || {};
+  var clsName = String(cls.name || "").trim();
+  var clsSchedule = (Object.prototype.hasOwnProperty.call(timetable, clsName) && timetable[clsName] && typeof timetable[clsName] === "object") ? timetable[clsName] : {};
 
   weekdays.forEach(function(day) {
     var slots = [];
+    var daySchedule = (clsSchedule && Object.prototype.hasOwnProperty.call(clsSchedule, day) && clsSchedule[day] && typeof clsSchedule[day] === "object") ? clsSchedule[day] : null;
     for (var p = 1; p <= 5; p++) {
-      if (clsSchedule[day] && clsSchedule[day][p]) {
+      if (daySchedule && Object.prototype.hasOwnProperty.call(daySchedule, p) && daySchedule[p]) {
+        var item = daySchedule[p];
         var timeStr = (formatPeriodTime(session, p) || "").replace(/\s+/g, "");
         slots.push({
           p: p,
-          sub: clsSchedule[day][p].subject,
-          tea: clsSchedule[day][p].teacher,
+          sub: item.subject ? String(item.subject).trim() : "(Chưa có môn)",
+          tea: item.teacher ? String(item.teacher).trim() : "",
           time: timeStr
         });
       }
@@ -1182,11 +1685,11 @@ function formatClassTimetableResponse(cls, schoolData, dayFilter) {
     if (slots.length > 0) {
       hasSlots = true;
       var dayTitle = (dayNames[day] || day).toUpperCase();
-      out += "\n🗓️ *" + dayTitle + "*:\n";
+      out += "\n🗓️ *" + escapeZaloMarkdown(dayTitle) + "*:\n";
       out += (session === "chiều" ? "🌇 Chiều:\n" : "🌅 Sáng:\n");
       slots.forEach(function(s) {
-        var teacherStr = s.tea ? " (" + s.tea + ")" : "";
-        out += "• Tiết " + s.p + " (" + s.time + "): " + s.sub + teacherStr + "\n";
+        var teacherStr = s.tea ? " (" + escapeZaloMarkdown(s.tea) + ")" : "";
+        out += "• Tiết " + s.p + " (" + s.time + "): " + escapeZaloMarkdown(s.sub) + teacherStr + "\n";
       });
     }
   });
@@ -1195,7 +1698,8 @@ function formatClassTimetableResponse(cls, schoolData, dayFilter) {
     out += "\n🌴 Lớp không có tiết học trong thời gian này.\n";
   }
 
-  out += "\n🌐 Xem TKB: " + CONFIG.PUBLIC_TKB_PORTAL + "?lop=" + encodeURIComponent(cls.name);
+  var portalUrl = (CONFIG && CONFIG.PUBLIC_TKB_PORTAL) ? CONFIG.PUBLIC_TKB_PORTAL : "";
+  out += "\n🌐 Xem TKB: " + portalUrl + "?lop=" + encodeURIComponent(clsName);
   return out;
 }
 
@@ -1203,7 +1707,17 @@ function formatClassTimetableResponse(cls, schoolData, dayFilter) {
  * Tạo tin nhắn TKB ngày mai thông minh cho Giáo viên
  */
 function generateTomorrowTeacherMessage(teacher, schoolData, targetDate) {
-  var tomorrow = targetDate || new Date(new Date().getTime() + 24 * 60 * 60 * 1000);
+  if (!teacher || typeof teacher !== "object") {
+    return "⚠️ Không tìm thấy thông tin giáo viên.";
+  }
+  if (!schoolData || typeof schoolData !== "object") {
+    return "⚠️ Không tìm thấy dữ liệu trường học.";
+  }
+  var teacherShortName = String(teacher.shortName || "").trim();
+  if (!teacherShortName) {
+    return "⚠️ Thiếu tên viết tắt của giáo viên.";
+  }
+  var tomorrow = (targetDate instanceof Date && !isNaN(targetDate.getTime())) ? targetDate : new Date(new Date().getTime() + 24 * 60 * 60 * 1000);
   var dayOfWeek = tomorrow.getDay(); // 0: Chủ Nhật, 1: T2, ..., 6: T7
   var dayMap = { 0: "CN", 1: "T2", 2: "T3", 3: "T4", 4: "T5", 5: "T6", 6: "T7" };
   var dayKey = dayMap[dayOfWeek] || "T2";
@@ -1211,30 +1725,36 @@ function generateTomorrowTeacherMessage(teacher, schoolData, targetDate) {
   var dayName = dayNames[dayKey] || dayKey;
   var dateStr = formatDateSafe(tomorrow, "dd/MM/yyyy");
 
-  var active = getActiveTimetable(schoolData);
-  var timetable = active.timetable || {};
-  var classes = schoolData.classes || [];
+  var active = getActiveTimetable(schoolData) || {};
+  var timetable = (active && active.timetable && typeof active.timetable === "object") ? active.timetable : {};
+  var classes = Array.isArray(schoolData.classes) ? schoolData.classes : [];
 
   var morningSlots = [];
   var afternoonSlots = [];
 
   if (dayKey !== "CN") {
     classes.forEach(function(c) {
-      var session = (c.session || "sáng").toLowerCase();
-      var clsTkb = timetable[c.name];
-      if (clsTkb && clsTkb[dayKey]) {
+      if (!c || typeof c !== "object") return;
+      var session = String(c.session || "sáng").toLowerCase();
+      var cName = String(c.name || "").trim();
+      var clsTkb = (Object.prototype.hasOwnProperty.call(timetable, cName) && timetable[cName] && typeof timetable[cName] === "object") ? timetable[cName] : null;
+      if (clsTkb && Object.prototype.hasOwnProperty.call(clsTkb, dayKey) && clsTkb[dayKey] && typeof clsTkb[dayKey] === "object") {
+        var dayPeriods = clsTkb[dayKey];
         for (var p = 1; p <= 5; p++) {
-          if (clsTkb[dayKey][p] && clsTkb[dayKey][p].teacher === teacher.shortName) {
-            var timeStr = (formatPeriodTime(session, p) || "").replace(/\s+/g, "");
-            var item = {
-              period: p,
-              subject: clsTkb[dayKey][p].subject,
-              className: c.name,
-              session: session,
-              time: timeStr
-            };
-            if (session === "sáng") morningSlots.push(item);
-            else afternoonSlots.push(item);
+          if (Object.prototype.hasOwnProperty.call(dayPeriods, p) && dayPeriods[p] && typeof dayPeriods[p] === "object") {
+            var periodObj = dayPeriods[p];
+            if (String(periodObj.teacher || "").trim() === teacherShortName) {
+              var timeStr = (formatPeriodTime(session, p) || "").replace(/\s+/g, "");
+              var item = {
+                period: p,
+                subject: periodObj.subject ? String(periodObj.subject).trim() : "(Chưa có môn)",
+                className: cName,
+                session: session,
+                time: timeStr
+              };
+              if (session === "sáng") morningSlots.push(item);
+              else afternoonSlots.push(item);
+            }
           }
         }
       }
@@ -1245,32 +1765,35 @@ function generateTomorrowTeacherMessage(teacher, schoolData, targetDate) {
   afternoonSlots.sort(function(a, b) { return a.period - b.period; });
   var totalPeriods = morningSlots.length + afternoonSlots.length;
 
-  var msg = "📅 LỊCH GIẢNG DẠY NGÀY MAI (*" + dayName + "* - " + dateStr + ")\n" +
-            "👤 Thầy/Cô: *" + teacher.fullName.toUpperCase() + "* (" + teacher.shortName + ")\n";
+  var teacherFullName = escapeZaloMarkdown(String(teacher.fullName || teacher.shortName || "").toUpperCase());
+  var teacherShort = escapeZaloMarkdown(teacherShortName);
+  var msg = "📅 LỊCH GIẢNG DẠY NGÀY MAI (*" + escapeZaloMarkdown(dayName) + "* - " + escapeZaloMarkdown(dateStr) + ")\n" +
+            "👤 Thầy/Cô: *" + teacherFullName + "* (" + teacherShort + ")\n";
 
   if (totalPeriods === 0) {
     msg += "\n🌴 Ngày mai Thầy/Cô *KHÔNG CÓ TIẾT DẠY*. Chúc Thầy/Cô có thời gian nghỉ ngơi vui vẻ!\n";
     var nextSchedule = findNextTeachingSession(teacher, schoolData, dayKey);
     if (nextSchedule) {
-      msg += "\n🗓️ *LỊCH DẠY BUỔI TIẾP THEO* (*" + nextSchedule.dayName + "*):\n" + nextSchedule.content + "\n";
+      msg += "\n🗓️ *LỊCH DẠY BUỔI TIẾP THEO* (*" + escapeZaloMarkdown(nextSchedule.dayName) + "*):\n" + nextSchedule.content + "\n";
     }
   } else {
     msg += "📋 Ngày mai Thầy/Cô có " + totalPeriods + " tiết dạy:\n";
     if (morningSlots.length > 0) {
       msg += "\n🌅 Sáng (" + morningSlots.length + " tiết):\n";
       morningSlots.forEach(function(s) {
-        msg += "• Tiết " + s.period + " (" + s.time + "): " + s.subject + " - " + s.className + "\n";
+        msg += "• Tiết " + s.period + " (" + s.time + "): " + escapeZaloMarkdown(s.subject) + " - " + escapeZaloMarkdown(s.className) + "\n";
       });
     }
     if (afternoonSlots.length > 0) {
       msg += "\n🌇 Chiều (" + afternoonSlots.length + " tiết):\n";
       afternoonSlots.forEach(function(s) {
-        msg += "• Tiết " + s.period + " (" + s.time + "): " + s.subject + " - " + s.className + "\n";
+        msg += "• Tiết " + s.period + " (" + s.time + "): " + escapeZaloMarkdown(s.subject) + " - " + escapeZaloMarkdown(s.className) + "\n";
       });
     }
   }
 
-  msg += "\n🌐 Tra cứu chi tiết: " + CONFIG.PUBLIC_TKB_PORTAL + "?gv=" + encodeURIComponent(teacher.shortName);
+  var portalUrl = (CONFIG && CONFIG.PUBLIC_TKB_PORTAL) ? CONFIG.PUBLIC_TKB_PORTAL : "";
+  msg += "\n🌐 Tra cứu chi tiết: " + portalUrl + "?gv=" + encodeURIComponent(teacherShortName);
   return msg;
 }
 
@@ -1278,9 +1801,14 @@ function generateTomorrowTeacherMessage(teacher, schoolData, targetDate) {
  * Tự động tìm buổi dạy gần nhất tiếp theo trong tuần
  */
 function findNextTeachingSession(teacher, schoolData, afterDayKey) {
-  var active = getActiveTimetable(schoolData);
-  var timetable = active.timetable || {};
-  var classes = schoolData.classes || [];
+  if (!teacher || typeof teacher !== "object" || !schoolData || typeof schoolData !== "object") {
+    return null;
+  }
+  var teacherShortName = String(teacher.shortName || "").trim();
+  if (!teacherShortName) return null;
+  var active = getActiveTimetable(schoolData) || {};
+  var timetable = (active && active.timetable && typeof active.timetable === "object") ? active.timetable : {};
+  var classes = Array.isArray(schoolData.classes) ? schoolData.classes : [];
   var order = ["T2", "T3", "T4", "T5", "T6", "T7"];
   var dayNames = { "T2": "Thứ Hai", "T3": "Thứ Ba", "T4": "Thứ Tư", "T5": "Thứ Năm", "T6": "Thứ Sáu", "T7": "Thứ Bảy" };
 
@@ -1291,19 +1819,25 @@ function findNextTeachingSession(teacher, schoolData, afterDayKey) {
     var d = order[(startIdx + step) % 6];
     var slots = [];
     classes.forEach(function(c) {
-      var session = (c.session || "sáng").toLowerCase();
-      var clsTkb = timetable[c.name];
-      if (clsTkb && clsTkb[d]) {
+      if (!c || typeof c !== "object") return;
+      var session = String(c.session || "sáng").toLowerCase();
+      var cName = String(c.name || "").trim();
+      var clsTkb = (Object.prototype.hasOwnProperty.call(timetable, cName) && timetable[cName] && typeof timetable[cName] === "object") ? timetable[cName] : null;
+      if (clsTkb && Object.prototype.hasOwnProperty.call(clsTkb, d) && clsTkb[d] && typeof clsTkb[d] === "object") {
+        var dayPeriods = clsTkb[d];
         for (var p = 1; p <= 5; p++) {
-          if (clsTkb[d][p] && clsTkb[d][p].teacher === teacher.shortName) {
-            var timeStr = (formatPeriodTime(session, p) || "").replace(/\s+/g, "");
-            slots.push({
-              p: p,
-              sub: clsTkb[d][p].subject,
-              cls: c.name,
-              session: session,
-              time: timeStr
-            });
+          if (Object.prototype.hasOwnProperty.call(dayPeriods, p) && dayPeriods[p] && typeof dayPeriods[p] === "object") {
+            var periodObj = dayPeriods[p];
+            if (String(periodObj.teacher || "").trim() === teacherShortName) {
+              var timeStr = (formatPeriodTime(session, p) || "").replace(/\s+/g, "");
+              slots.push({
+                p: p,
+                sub: periodObj.subject ? String(periodObj.subject).trim() : "(Chưa có môn)",
+                cls: cName,
+                session: session,
+                time: timeStr
+              });
+            }
           }
         }
       }
@@ -1317,13 +1851,13 @@ function findNextTeachingSession(teacher, schoolData, afterDayKey) {
       if (morning.length > 0) {
         lines.push("🌅 Sáng:");
         morning.forEach(function(s) {
-          lines.push("• Tiết " + s.p + " (" + s.time + "): " + s.sub + " - " + s.cls);
+          lines.push("• Tiết " + s.p + " (" + s.time + "): " + escapeZaloMarkdown(s.sub) + " - " + escapeZaloMarkdown(s.cls));
         });
       }
       if (afternoon.length > 0) {
         lines.push("🌇 Chiều:");
         afternoon.forEach(function(s) {
-          lines.push("• Tiết " + s.p + " (" + s.time + "): " + s.sub + " - " + s.cls);
+          lines.push("• Tiết " + s.p + " (" + s.time + "): " + escapeZaloMarkdown(s.sub) + " - " + escapeZaloMarkdown(s.cls));
         });
       }
       return {
@@ -1340,85 +1874,136 @@ function findNextTeachingSession(teacher, schoolData, afterDayKey) {
  * HÀM TEST NHANH 1-CHẠM: Gửi thử lịch ngày mai cho giáo viên theo SĐT
  */
 function testSendTomorrowSchedule(targetPhone) {
-  var phone = targetPhone || "0818810007";
-  var normPhone = normalizePhone(phone);
-  Logger.log("🚀 [TestTomorrow] Bắt đầu kiểm tra gửi lịch ngày mai cho SĐT: " + phone);
+  try {
+    var phone = targetPhone || "0818810007";
+    var normPhone = normalizePhone(phone);
+    Logger.log("🚀 [TestTomorrow] Bắt đầu kiểm tra gửi lịch ngày mai cho SĐT: " + phone);
 
-  var schoolData = fetchSchoolTimetableData();
-  if (!schoolData) {
-    return { success: false, error: "Không thể kết nối dữ liệu Firebase TKB" };
-  }
-
-  var ss = getDatabaseSpreadsheet();
-  if (!ss) {
-    return { success: false, error: "Không mở được cơ sở dữ liệu Spreadsheet" };
-  }
-  var sheetUsers = ss.getSheetByName(CONFIG.SHEET_USERS);
-  if (!sheetUsers) {
-    return { success: false, error: "Không tìm thấy Sheet Danh bạ GV" };
-  }
-
-  var data = sheetUsers.getDataRange().getValues();
-  var foundTeacher = null;
-  var chatId = null;
-  var shortName = null;
-
-  for (var i = 1; i < data.length; i++) {
-    var rowPhone = normalizePhone(String(data[i][2] || ""));
-    if (rowPhone === normPhone) {
-      foundTeacher = String(data[i][1] || "");
-      chatId = String(data[i][5] || "").trim();
-      shortName = String(data[i][7] || "").trim();
-      break;
+    var schoolData;
+    try {
+      schoolData = fetchSchoolTimetableData();
+    } catch (errSchool) {
+      Logger.log("⚠️ [TestTomorrow] Lỗi kết nối fetchSchoolTimetableData: " + errSchool);
+      return { success: false, error: "Không thể kết nối dữ liệu Firebase TKB: " + (errSchool && errSchool.message ? errSchool.message : String(errSchool)) };
     }
+    if (!schoolData || typeof schoolData !== "object") {
+      return { success: false, error: "Không thể kết nối dữ liệu Firebase TKB" };
+    }
+
+    var ss;
+    try {
+      ss = getDatabaseSpreadsheet();
+    } catch (errSs) {
+      Logger.log("⚠️ [TestTomorrow] Lỗi mở Database Spreadsheet: " + errSs);
+      return { success: false, error: "Không mở được cơ sở dữ liệu Spreadsheet" };
+    }
+    if (!ss) {
+      return { success: false, error: "Không mở được cơ sở dữ liệu Spreadsheet" };
+    }
+    var sheetUsers = ss.getSheetByName(CONFIG.SHEET_USERS);
+    if (!sheetUsers) {
+      return { success: false, error: "Không tìm thấy Sheet Danh bạ GV" };
+    }
+
+    var data;
+    try {
+      data = sheetUsers.getDataRange().getValues();
+    } catch (errData) {
+      Logger.log("⚠️ [TestTomorrow] Lỗi đọc dữ liệu sheetUsers: " + errData);
+      return { success: false, error: "Lỗi truy xuất dữ liệu Danh bạ GV" };
+    }
+    if (!Array.isArray(data)) {
+      return { success: false, error: "Dữ liệu Danh bạ GV không hợp lệ" };
+    }
+    var foundTeacher = null;
+    var chatId = null;
+    var shortName = null;
+
+    for (var i = 1; i < data.length; i++) {
+      if (!Array.isArray(data[i])) continue;
+      var rowPhone = normalizePhone(String(data[i][2] || ""));
+      if (rowPhone && rowPhone === normPhone) {
+        foundTeacher = String(data[i][1] || "");
+        chatId = String(data[i][5] || "").trim();
+        shortName = String(data[i][7] || "").trim();
+        break;
+      }
+    }
+
+    if (!foundTeacher) {
+      return { success: false, error: "Không tìm thấy giáo viên với SĐT " + phone + " trong Danh bạ GV" };
+    }
+
+    var teachersList = Array.isArray(schoolData.teachers) ? schoolData.teachers : [];
+    var matchedTeacher = findMatchingTeacher(shortName || foundTeacher, teachersList);
+    if (!matchedTeacher) {
+      return { success: false, error: "Không khớp được giáo viên trong dữ liệu TKB với tên: " + (shortName || foundTeacher) };
+    }
+
+    var tomorrowMsg = generateTomorrowTeacherMessage(matchedTeacher, schoolData);
+    Logger.log("📝 Nội dung tin nhắn chuẩn bị gửi:\n" + tomorrowMsg);
+
+    var sentToZalo = false;
+    if (chatId) {
+      try {
+        sendZaloBotReply(chatId, tomorrowMsg);
+        sentToZalo = true;
+        Logger.log("✅ Đã phát lệnh gửi Zalo Bot tới Chat ID: " + chatId);
+      } catch (errSend) {
+        Logger.log("⚠️ [TestTomorrow] Lỗi phát lệnh sendZaloBotReply: " + errSend);
+        return {
+          success: false,
+          error: "Không thể gửi tin nhắn qua Zalo Bot: " + (errSend && errSend.message ? errSend.message : String(errSend)),
+          teacher: matchedTeacher.fullName || "",
+          shortName: matchedTeacher.shortName || "",
+          chatId: chatId,
+          message: tomorrowMsg
+        };
+      }
+    } else {
+      Logger.log("⚠️ Giáo viên chưa có Zalo_Chat_ID trong Sheet. Tin nhắn chưa thể chuyển trực tiếp qua Zalo.");
+    }
+
+    return {
+      success: true,
+      sentToZalo: sentToZalo,
+      teacher: matchedTeacher.fullName || "",
+      shortName: matchedTeacher.shortName || "",
+      chatId: chatId,
+      message: tomorrowMsg
+    };
+  } catch (err) {
+    Logger.log("❌ [TestTomorrow] Lỗi không mong muốn trong testSendTomorrowSchedule: " + err);
+    return {
+      success: false,
+      error: "Lỗi hệ thống khi kiểm tra gửi lịch: " + (err && err.message ? err.message : String(err))
+    };
   }
-
-  if (!foundTeacher) {
-    return { success: false, error: "Không tìm thấy giáo viên với SĐT " + phone + " trong Danh bạ GV" };
-  }
-
-  var matchedTeacher = findMatchingTeacher(shortName || foundTeacher, schoolData.teachers || []);
-  if (!matchedTeacher) {
-    return { success: false, error: "Không khớp được giáo viên trong dữ liệu TKB với tên: " + (shortName || foundTeacher) };
-  }
-
-  var tomorrowMsg = generateTomorrowTeacherMessage(matchedTeacher, schoolData);
-  Logger.log("📝 Nội dung tin nhắn chuẩn bị gửi:\n" + tomorrowMsg);
-
-  if (chatId) {
-    sendZaloBotReply(chatId, tomorrowMsg);
-    Logger.log("✅ Đã phát lệnh gửi Zalo Bot tới Chat ID: " + chatId);
-  } else {
-    Logger.log("⚠️ Giáo viên chưa có Zalo_Chat_ID trong Sheet. Tin nhắn chưa thể chuyển trực tiếp qua Zalo.");
-  }
-
-  return {
-    success: true,
-    teacher: matchedTeacher.fullName,
-    shortName: matchedTeacher.shortName,
-    chatId: chatId,
-    message: tomorrowMsg
-  };
 }
 
 // ====================================================================================================
 // 🔍 11. XỬ LÝ TRA CỨU NGÔN NGỮ TỰ NHIÊN (NLP MATCHERS)
 // ====================================================================================================
 function handleNaturalTimetableQuery(text, clean, schoolData) {
-  var classes = schoolData.classes || [];
-  var teachers = schoolData.teachers || [];
-  var dayFilter = parseDayFilter(clean);
+  if (!schoolData || typeof schoolData !== "object") {
+    return "⚠️ Không có dữ liệu thời khóa biểu trường.";
+  }
+  var safeText = String(text || "").trim();
+  var safeClean = String(clean || "").trim();
+  var classes = Array.isArray(schoolData.classes) ? schoolData.classes : [];
+  var teachers = Array.isArray(schoolData.teachers) ? schoolData.teachers : [];
+  var dayFilter = parseDayFilter(safeClean);
 
   // 1. Kiểm tra Lớp học (Chính xác 100%, chống 6A10 ra 6A1)
-  var matchedClass = findMatchingClass(text, classes);
+  var matchedClass = findMatchingClass(safeText, classes);
   if (matchedClass) {
     return formatClassTimetableResponse(matchedClass, schoolData, dayFilter);
   }
 
   // 2. Kiểm tra Giáo viên (Chính xác 100%, chống P.Thúy ra Thu)
-  var matchedTeacher = findMatchingTeacher(text, teachers);
+  var matchedTeacher = findMatchingTeacher(safeText, teachers);
   if (matchedTeacher) {
-    var isTomorrow = (clean.indexOf("mai") !== -1);
+    var isTomorrow = (safeClean.indexOf("mai") !== -1);
     if (isTomorrow) {
       return generateTomorrowTeacherMessage(matchedTeacher, schoolData);
     }
@@ -1426,7 +2011,7 @@ function handleNaturalTimetableQuery(text, clean, schoolData) {
   }
 
   // 3. Nếu người dùng chỉ gõ "tkb" nhưng chưa liên kết SĐT
-  if (clean.startsWith("tkb") || clean.startsWith("thoi khoa bieu") || clean.startsWith("lich day")) {
+  if (safeClean.indexOf("tkb") === 0 || safeClean.indexOf("thoi khoa bieu") === 0 || safeClean.indexOf("lich day") === 0) {
     return "💡 Thầy/Cô vui lòng nhập đúng Tên viết tắt (VD: \"tkb Trọng\", \"tkb P.Thúy\") hoặc Tên lớp (VD: \"tkb 6A1\", \"tkb 9B2\").\n\n" +
            "📱 Nếu Thầy/Cô là Giáo viên: Hãy gửi [Số Điện Thoại] để kích hoạt nhận lịch dạy tự động lúc 6h00 sáng!";
   }
@@ -1435,8 +2020,8 @@ function handleNaturalTimetableQuery(text, clean, schoolData) {
 }
 
 function handleSubstitutionQuery(schoolData) {
-  if (!schoolData) return "❌ Không thể kết nối cơ sở dữ liệu thời khóa biểu.";
-  var subs = schoolData.substitutions || [];
+  if (!schoolData || typeof schoolData !== "object") return "❌ Không thể kết nối cơ sở dữ liệu thời khóa biểu.";
+  var subs = Array.isArray(schoolData.substitutions) ? schoolData.substitutions : [];
   if (subs.length === 0) {
     return "🔄 LỊCH DẠY THAY & HỌC THAY\n✨ Hiện tại không có ca dạy thay / học thay nào trong tuần này.";
   }
@@ -1444,6 +2029,7 @@ function handleSubstitutionQuery(schoolData) {
   var out = "🔄 LỊCH DẠY THAY & HỌC THAY\n📌 Cập nhật danh sách phân công dạy thay:\n\n";
 
   subs.forEach(function(s, idx) {
+    if (!s || typeof s !== "object") return;
     out += (idx + 1) + ". Ngày " + (s.date || s.day || "Trong tuần") + " - Tiết " + (s.period || "") + "\n" +
            "• Lớp: " + (s.className || "") + " | Môn: " + (s.subject || "") + "\n" +
            "• GV vắng: " + (s.originalTeacher || "N/A") + "\n" +
@@ -1455,27 +2041,42 @@ function handleSubstitutionQuery(schoolData) {
 }
 
 function handleFindFreeTeacherQuery(text, clean, schoolData) {
-  if (!schoolData) return "❌ Không thể kết nối cơ sở dữ liệu trường.";
+  if (!schoolData || typeof schoolData !== "object") return "❌ Không thể kết nối cơ sở dữ liệu trường.";
 
-  var teachers = schoolData.teachers || [];
-  var classes = schoolData.classes || [];
-  var timetable = getActiveTimetable(schoolData).timetable || {};
+  var teachers = Array.isArray(schoolData.teachers) ? schoolData.teachers : [];
+  var classes = Array.isArray(schoolData.classes) ? schoolData.classes : [];
+  var active = getActiveTimetable(schoolData) || {};
+  var timetable = (active && active.timetable && typeof active.timetable === "object") ? active.timetable : {};
 
-  var day = parseDayFilter(clean) || "T2";
+  var safeClean = String(clean || "").trim();
+  var rawStr = (text ? String(text) : "") + " " + safeClean;
+  var normalizedSearch = typeof removeVietnameseTones === "function" ? removeVietnameseTones(rawStr).toLowerCase() : rawStr.toLowerCase();
+
+  var day = parseDayFilter(safeClean) || "T2";
   var period = 1;
-  var pMatch = clean.match(/tiet\s*(\d)|t(\d)/);
-  if (pMatch) {
-    period = parseInt(pMatch[1] || pMatch[2]);
+  var pMatch = normalizedSearch.match(/(?:tiet|t)\s*(\d{1,2})/);
+  if (pMatch && pMatch[1]) {
+    var parsedP = parseInt(pMatch[1], 10);
+    if (!isNaN(parsedP) && parsedP >= 1 && parsedP <= 12) {
+      period = parsedP;
+    }
   }
 
   var freeTeachers = [];
   teachers.forEach(function(t) {
-    if (!t || !t.shortName) return;
+    if (!t || typeof t !== "object" || !t.shortName) return;
+    var tShortName = String(t.shortName).trim();
     var isBusy = false;
     classes.forEach(function(c) {
-      if (timetable[c.name] && timetable[c.name][day] && timetable[c.name][day][period]) {
-        if (timetable[c.name][day][period].teacher === t.shortName) {
-          isBusy = true;
+      if (!c || typeof c !== "object" || !c.name) return;
+      var cName = String(c.name).trim();
+      var cSchedule = (Object.prototype.hasOwnProperty.call(timetable, cName) && timetable[cName] && typeof timetable[cName] === "object") ? timetable[cName] : null;
+      if (cSchedule && Object.prototype.hasOwnProperty.call(cSchedule, day) && cSchedule[day] && typeof cSchedule[day] === "object") {
+        var dayPeriods = cSchedule[day];
+        if (Object.prototype.hasOwnProperty.call(dayPeriods, period) && dayPeriods[period] && typeof dayPeriods[period] === "object") {
+          if (String(dayPeriods[period].teacher || "").trim() === tShortName) {
+            isBusy = true;
+          }
         }
       }
     });
@@ -1485,16 +2086,19 @@ function handleFindFreeTeacherQuery(text, clean, schoolData) {
   });
 
   var dayNames = { "T2": "Thứ Hai", "T3": "Thứ Ba", "T4": "Thứ Tư", "T5": "Thứ Năm", "T6": "Thứ Sáu", "T7": "Thứ Bảy" };
+  var dayLabel = escapeZaloMarkdown(dayNames[day] || day);
   var out = "👥 GIÁO VIÊN TRỐNG TIẾT DẠY THAY\n" +
-            "🗓️ Thời gian: " + (dayNames[day] || day) + " - Tiết " + period + "\n\n";
+            "🗓️ Thời gian: " + dayLabel + " - Tiết " + period + "\n\n";
 
   if (freeTeachers.length === 0) {
-    out += "⚠️ Rất tiếc, không có giáo viên nào đang trống ở Tiết " + period + " " + (dayNames[day] || day) + ".";
+    out += "⚠️ Rất tiếc, không có giáo viên nào đang trống ở Tiết " + period + " " + dayLabel + ".";
   } else {
     out += "✅ Tìm thấy " + freeTeachers.length + " Giáo viên đang TRỐNG TIẾT có thể phân công dạy thay:\n\n";
     freeTeachers.forEach(function(t, i) {
-      var groupStr = t.group ? (" - Tổ: " + t.group.replace(/^g_/, "Tổ ").replace(/_/g, " ")) : "";
-      out += (i + 1) + ". 👤 " + t.fullName + " (" + t.shortName + ")" + groupStr + "\n";
+      var groupStr = t.group ? (" - Tổ: " + escapeZaloMarkdown(String(t.group).replace(/^g_/, "Tổ ").replace(/_/g, " "))) : "";
+      var tName = escapeZaloMarkdown(String(t.fullName || t.shortName || "").trim());
+      var tShort = escapeZaloMarkdown(String(t.shortName || "").trim());
+      out += (i + 1) + ". 👤 " + tName + " (" + tShort + ")" + groupStr + "\n";
     });
   }
 
@@ -1502,38 +2106,64 @@ function handleFindFreeTeacherQuery(text, clean, schoolData) {
 }
 
 function handleNewTimetableAnnouncement(schoolData) {
-  if (!schoolData) return "❌ Không thể kết nối cơ sở dữ liệu thời khóa biểu.";
-  var active = getActiveTimetable(schoolData);
-  return "📢 THÔNG BÁO THỜI KHÓA BIỂU\n" +
-         "📌 Đợt TKB: " + (active.weekName || "Thời khóa biểu chính thức") + "\n" +
-         "🗓️ Áp dụng từ: " + (active.applyDate || "Toàn trường") + "\n\n" +
+  if (!schoolData || typeof schoolData !== "object") return "❌ Không thể kết nối cơ sở dữ liệu thời khóa biểu.";
+  var active = getActiveTimetable(schoolData) || {};
+  var weekName = escapeZaloMarkdown(String(active.weekName || "Thời khóa biểu chính thức").trim());
+  var applyDate = escapeZaloMarkdown(String(active.applyDate || "Toàn trường").trim());
+  var portalUrl = (CONFIG && typeof CONFIG.PUBLIC_TKB_PORTAL === "string") ? CONFIG.PUBLIC_TKB_PORTAL.trim() : "";
+  var safePortalUrl = "";
+  if (/^https?:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=]+$/.test(portalUrl)) {
+    safePortalUrl = portalUrl;
+  }
+  var msg = "📢 THÔNG BÁO THỜI KHÓA BIỂU\n" +
+         "📌 Đợt TKB: " + weekName + "\n" +
+         "🗓️ Áp dụng từ: " + applyDate + "\n\n" +
          "Thầy/Cô và các em học sinh có thể tra cứu nhanh bằng cách gõ:\n" +
-         "👉 tkb [Tên Lớp hoặc Tên GV]\n\n" +
-         "🌐 Hoặc xem bảng trực tuyến 1 chạm tại:\n" +
-         CONFIG.PUBLIC_TKB_PORTAL + "?tra-cuu";
+         "👉 tkb [Tên Lớp hoặc Tên GV]\n";
+  if (safePortalUrl) {
+    msg += "\n🌐 Hoặc xem bảng trực tuyến 1 chạm tại:\n" + safePortalUrl + "?tra-cuu";
+  }
+  return msg;
 }
 
 // ====================================================================================================
 // 🔗 12. HÀM MAPPING SỐ ĐIỆN THOẠI -> ZALO CHAT ID BẢO MẬT (DEFECT-ZALO-04)
 // ====================================================================================================
 function handleSecurePhoneMapping(chatId, phoneInput, secretPin) {
-  var ss = getDatabaseSpreadsheet();
+  var ss;
+  try {
+    ss = getDatabaseSpreadsheet();
+  } catch (errSs) {
+    Logger.log("⚠️ [SecurePhoneMapping] Lỗi getDatabaseSpreadsheet: " + errSs);
+    return "⚠️ Không thể kết nối cơ sở dữ liệu.";
+  }
+  if (!ss) return "⚠️ Không mở được cơ sở dữ liệu.";
   var sheet = ss.getSheetByName(CONFIG.SHEET_USERS);
   if (!sheet) return "⚠️ Không tìm thấy bảng 'Danh bạ GV'.";
 
-  var data = sheet.getDataRange().getValues();
-  var normPhone = normalizePhone(phoneInput);
+  var data;
+  try {
+    data = sheet.getDataRange().getValues();
+  } catch (errData) {
+    Logger.log("⚠️ [SecurePhoneMapping] Lỗi đọc dữ liệu sheet: " + errData);
+    return "⚠️ Lỗi truy xuất danh bạ giáo viên.";
+  }
+  if (!Array.isArray(data)) return "⚠️ Dữ liệu danh bạ không hợp lệ.";
+
+  var cleanPhoneInput = String(phoneInput || "").trim().slice(0, 20);
+  var normPhone = normalizePhone(cleanPhoneInput);
   var matchedRow = -1;
   var teacherName = "";
   var department = "";
   var storedPin = "";
 
   for (var i = 1; i < data.length; i++) {
+    if (!Array.isArray(data[i])) continue;
     var rawRowPhone = String(data[i][2] || "").trim();
-    if (normalizePhone(rawRowPhone) === normPhone) {
+    if (rawRowPhone && normalizePhone(rawRowPhone) === normPhone) {
       matchedRow = i + 1;
-      teacherName = data[i][1];
-      department = data[i][3];
+      teacherName = String(data[i][1] || "");
+      department = String(data[i][3] || "");
       var rawPinVal = data[i][8];
       storedPin = (rawPinVal !== undefined && rawPinVal !== null) ? String(rawPinVal).replace(/^'+/, "").trim() : ""; // Cột 9: Mã PIN bí mật
       break;
@@ -1541,19 +2171,25 @@ function handleSecurePhoneMapping(chatId, phoneInput, secretPin) {
   }
 
   if (matchedRow === -1) {
-    return "⚠️ Số điện thoại [" + phoneInput + "] không có trong danh bạ trường THCS Chu Văn An.\n\nThầy/Cô vui lòng liên hệ Ban Quản trị nhà trường để kiểm tra cập nhật số điện thoại.";
+    var safePhoneDisplay = "";
+    if (normPhone && normPhone.length >= 7) {
+      safePhoneDisplay = normPhone.substring(0, 3) + "****" + normPhone.substring(normPhone.length - 3);
+    } else {
+      safePhoneDisplay = escapeZaloMarkdown(cleanPhoneInput.slice(0, 15));
+    }
+    return "⚠️ Số điện thoại [" + safePhoneDisplay + "] không có trong danh bạ trường THCS Chu Văn An.\n\nThầy/Cô vui lòng liên hệ Ban Quản trị nhà trường để kiểm tra cập nhật số điện thoại.";
   }
 
   // Phòng thủ đa tầng cho Mã PIN:
   // Nếu storedPin trên Sheet bị lưu số đơn lẻ (7 -> 0007 do Google Sheet ép kiểu số), tự động bù padStart(4, '0')
   if (storedPin && /^\d+$/.test(storedPin) && storedPin.length < 4) {
-    storedPin = storedPin.padStart(4, "0");
+    storedPin = ("0000" + storedPin).slice(-4);
   }
 
   // Chuẩn hóa PIN người dùng gửi: loại bỏ dấu nháy, tự động padStart(4, '0') nếu là số < 4 chữ số
   var pinClean = String(secretPin || "").replace(/^'+/, "").trim();
   if (pinClean && /^\d+$/.test(pinClean) && pinClean.length < 4) {
-    pinClean = pinClean.padStart(4, "0");
+    pinClean = ("0000" + pinClean).slice(-4);
   }
 
   // Bắt buộc đối soát khớp chính xác secretPin === storedPin, loại bỏ hoàn toàn fallback bypass bằng 4 số cuối SĐT
@@ -1582,12 +2218,14 @@ function handleSecurePhoneMapping(chatId, phoneInput, secretPin) {
         cellPin.setValue("'" + storedPin);
       }
     }
-  } catch (eHeal) {}
+  } catch (eHeal) {
+    Logger.log("⚠️ [SecurePhoneMapping] Self-healing warning: " + eHeal);
+  }
 
   return "🎉 LIÊN KẾT ZALO THÀNH CÔNG!\n\n" +
-         "👤 Thầy/Cô: " + teacherName + "\n" +
-         "🏫 Đơn vị: " + department + "\n" +
-         "📱 Số điện thoại: " + phoneInput + "\n" +
+         "👤 Thầy/Cô: " + escapeZaloMarkdown(teacherName) + "\n" +
+         "🏫 Đơn vị: " + escapeZaloMarkdown(department) + "\n" +
+         "📱 Số điện thoại: " + escapeZaloMarkdown(normPhone || cleanPhoneInput) + "\n" +
          "⏰ Đã kích hoạt: Nhận nhắc Lịch dạy 6h00 sáng & Thông báo duyệt ký số giáo án!";
 }
 
@@ -1595,19 +2233,58 @@ function handleSecurePhoneMapping(chatId, phoneInput, secretPin) {
 // 📋 12.1 TRA CỨU HỒ SƠ THEO MÃ ĐỊNH DANH (DEFECT-ZALO-02)
 // ====================================================================================================
 function handleLookupSpecificDocument(chatId, docId) {
-  var ss = getDatabaseSpreadsheet();
+  if (!chatId) {
+    return "⚠️ Thiếu định danh người dùng. Vui lòng nhắn tin trực tiếp từ tài khoản Zalo đã liên kết!";
+  }
+  var teacher;
+  try {
+    teacher = getTeacherProfileByChatId(chatId);
+  } catch (errTeacher) {
+    Logger.log("⚠️ [LookupDoc] Lỗi getTeacherProfileByChatId: " + errTeacher);
+  }
+  if (!teacher) {
+    return "⚠️ Thầy/Cô chưa liên kết tài khoản Zalo. Vui lòng gửi [Số điện thoại] và [Mã PIN] để liên kết trước khi tra cứu!";
+  }
+
+  var targetId = String(docId || "").trim().toUpperCase();
+  if (!targetId) {
+    return "⚠️ Mã hồ sơ không hợp lệ. Thầy/Cô vui lòng cung cấp mã hồ sơ cần tra cứu.";
+  }
+  var ss;
+  try {
+    ss = getDatabaseSpreadsheet();
+  } catch (errSs) {
+    Logger.log("⚠️ [LookupDoc] Lỗi getDatabaseSpreadsheet: " + errSs);
+    return "⚠️ Cơ sở dữ liệu chưa sẵn sàng.";
+  }
   if (!ss) return "⚠️ Cơ sở dữ liệu chưa sẵn sàng.";
-  var sheet = ss.getSheetByName(CONFIG.SHEET_REPORTS);
+
+  var sheetName = (CONFIG && CONFIG.SHEET_REPORTS) ? CONFIG.SHEET_REPORTS : "Reports";
+  var sheet;
+  try {
+    sheet = ss.getSheetByName(sheetName);
+  } catch (errSheet) {
+    Logger.log("⚠️ [LookupDoc] Lỗi getSheetByName: " + errSheet);
+    return "⚠️ Lỗi kết nối sổ báo cáo.";
+  }
   if (!sheet) return "⚠️ Không tìm thấy sổ báo cáo.";
 
-  var data = sheet.getDataRange().getValues();
+  var data;
+  try {
+    data = sheet.getDataRange().getValues();
+  } catch (errData) {
+    Logger.log("⚠️ [LookupDoc] Lỗi đọc dữ liệu sheet: " + errData);
+    return "⚠️ Lỗi truy xuất cơ sở dữ liệu báo cáo.";
+  }
+  if (!Array.isArray(data)) return "⚠️ Dữ liệu báo cáo không hợp lệ.";
+
   var foundDoc = null;
-  var targetId = String(docId || "").trim().toUpperCase();
 
   for (var i = 1; i < data.length; i++) {
+    if (!Array.isArray(data[i])) continue;
     var col0 = String(data[i][0] || "").trim().toUpperCase();
     var col1 = String(data[i][1] || "").trim().toUpperCase();
-    if (col0 === targetId || col1 === targetId) {
+    if ((col0 && col0 === targetId) || (col1 && col1 === targetId)) {
       if (col0 === targetId) {
         foundDoc = {
           id: data[i][0],
@@ -1636,45 +2313,118 @@ function handleLookupSpecificDocument(chatId, docId) {
   }
 
   if (!foundDoc) {
-    return "🔍 Không tìm thấy hồ sơ có mã: [" + docId + "].\nThầy/Cô vui lòng kiểm tra lại mã trên hệ thống EduSign!";
+    var safeDocId = escapeZaloMarkdown(targetId.slice(0, 30));
+    return "🔍 Không tìm thấy hồ sơ có mã: [" + safeDocId + "].\nThầy/Cô vui lòng kiểm tra lại mã trên hệ thống EduSign!";
+  }
+
+  // Kiểm tra quyền truy cập hồ sơ theo vai trò và đơn vị đã xác thực
+  var docAuthor = String(foundDoc.author || "").trim().toLowerCase();
+  var docApprover = String(foundDoc.approver || "").trim().toLowerCase();
+  var docDept = String(foundDoc.dept || "").trim().toLowerCase();
+  var teacherFull = String(teacher.fullName || "").trim().toLowerCase();
+  var teacherShort = String(teacher.shortName || "").trim().toLowerCase();
+  var teacherDept = String(teacher.department || "").trim().toLowerCase();
+
+  var isAuthor = Boolean((teacherFull && docAuthor === teacherFull) || (teacherShort && docAuthor === teacherShort));
+  var isApprover = Boolean((teacherFull && docApprover === teacherFull) || (teacherShort && docApprover === teacherShort));
+  var isSameDept = Boolean(teacherDept && docDept && teacherDept === docDept);
+  var bghRoles = ["bgh", "ban giám hiệu", "bgh - ban giám hiệu", "quản trị", "admin"];
+  var isBGH = bghRoles.indexOf(teacherDept) !== -1;
+
+  if (!isAuthor && !isApprover && !isSameDept && !isBGH) {
+    return "⛔ Thầy/Cô không có quyền truy cập hồ sơ này. Chỉ tác giả, người duyệt, tổ bộ môn hoặc Ban Giám Hiệu mới có thể xem chi tiết hồ sơ.";
+  }
+
+  var safeViewUrl = "";
+  if (foundDoc.viewUrl && /^https?:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=]+$/.test(String(foundDoc.viewUrl).trim())) {
+    safeViewUrl = String(foundDoc.viewUrl).trim();
   }
 
   return "╔════════════════════════════════════════╗\n" +
-         "  📋 THÔNG TIN HỒ SƠ: " + (foundDoc.id || docId) + "\n" +
+         "  📋 THÔNG TIN HỒ SƠ: " + escapeZaloMarkdown(String(foundDoc.id || targetId)) + "\n" +
          "╚════════════════════════════════════════╝\n\n" +
-         "📄 Tên: " + (foundDoc.title || "Chưa có tên") + "\n" +
-         "🏫 Đơn vị: " + (foundDoc.dept || "Toàn trường") + "\n" +
-         "👤 Tác giả: " + (foundDoc.author || "Giáo viên") + "\n" +
-         "✍️ Người duyệt: " + (foundDoc.approver || "Chờ duyệt") + "\n" +
-         "📊 Trạng thái: " + (foundDoc.status || "Đang xử lý") + "\n" +
-         "⏰ Ngày ký: " + (foundDoc.signedDate || "Chưa ký") + "\n\n" +
-         (foundDoc.viewUrl ? ("📂 Tải tệp đã ký:\n👉 " + foundDoc.viewUrl) : "📌 Hồ sơ chưa hoàn tất ký số.");
+         "📄 Tên: " + escapeZaloMarkdown(String(foundDoc.title || "Chưa có tên")) + "\n" +
+         "🏫 Đơn vị: " + escapeZaloMarkdown(String(foundDoc.dept || "Toàn trường")) + "\n" +
+         "👤 Tác giả: " + escapeZaloMarkdown(String(foundDoc.author || "Giáo viên")) + "\n" +
+         "✍️ Người duyệt: " + escapeZaloMarkdown(String(foundDoc.approver || "Chờ duyệt")) + "\n" +
+         "📊 Trạng thái: " + escapeZaloMarkdown(String(foundDoc.status || "Đang xử lý")) + "\n" +
+         "⏰ Ngày ký: " + escapeZaloMarkdown(String(foundDoc.signedDate || "Chưa ký")) + "\n\n" +
+         (safeViewUrl ? ("📂 Tải tệp đã ký:\n👉 " + safeViewUrl) : "📌 Hồ sơ chưa hoàn tất ký số.");
 }
 
 // ====================================================================================================
 // ⏳ 12.2 TRA CỨU DANH SÁCH HỒ SƠ CHỜ DUYỆT (DEFECT-ZALO-03)
 // ====================================================================================================
 function handleLookupPendingDocuments(chatId) {
-  var teacher = getTeacherProfileByChatId(chatId);
-  if (!teacher) {
+  if (!chatId) {
+    return "⚠️ Thiếu định danh người dùng. Vui lòng nhắn tin trực tiếp từ tài khoản Zalo đã liên kết!";
+  }
+  var teacher;
+  try {
+    teacher = getTeacherProfileByChatId(chatId);
+  } catch (errTeacher) {
+    Logger.log("⚠️ [LookupPending] Lỗi getTeacherProfileByChatId: " + errTeacher);
+  }
+  if (!teacher || typeof teacher !== "object") {
     return "⚠️ Thầy/Cô chưa liên kết tài khoản. Vui lòng nhắn SĐT để liên kết trước!";
   }
 
-  var ss = getDatabaseSpreadsheet();
-  var sheet = ss.getSheetByName(CONFIG.SHEET_REPORTS);
+  var ss;
+  try {
+    ss = getDatabaseSpreadsheet();
+  } catch (errSs) {
+    Logger.log("⚠️ [LookupPending] Lỗi getDatabaseSpreadsheet: " + errSs);
+    return "⚠️ Cơ sở dữ liệu chưa sẵn sàng.";
+  }
+  if (!ss) return "⚠️ Sổ báo cáo chưa được khởi tạo.";
+
+  var sheetName = (CONFIG && CONFIG.SHEET_REPORTS) ? CONFIG.SHEET_REPORTS : "Reports";
+  var sheet;
+  try {
+    sheet = ss.getSheetByName(sheetName);
+  } catch (errSheet) {
+    Logger.log("⚠️ [LookupPending] Lỗi getSheetByName: " + errSheet);
+    return "⚠️ Lỗi truy xuất sổ báo cáo.";
+  }
   if (!sheet) return "⚠️ Sổ báo cáo chưa được khởi tạo.";
 
-  var data = sheet.getDataRange().getValues();
+  var data;
+  try {
+    data = sheet.getDataRange().getValues();
+  } catch (errData) {
+    Logger.log("⚠️ [LookupPending] Lỗi đọc dữ liệu sheet: " + errData);
+    return "⚠️ Lỗi truy xuất danh sách báo cáo.";
+  }
+  if (!Array.isArray(data)) return "⚠️ Dữ liệu báo cáo không hợp lệ.";
+
+  var teacherDept = String(teacher.department || "").trim().toLowerCase();
+  var bghRoles = ["bgh", "ban giám hiệu", "bgh - ban giám hiệu", "quản trị", "admin"];
+  var isBGH = bghRoles.indexOf(teacherDept) !== -1;
+  var teacherFull = String(teacher.fullName || "").trim().toLowerCase();
+  var teacherShort = String(teacher.shortName || "").trim().toLowerCase();
+
   var pendingList = [];
   for (var i = 1; i < data.length; i++) {
+    if (!Array.isArray(data[i])) continue;
     var status = String(data[i][7] || data[i][6] || "").toUpperCase();
     if (status.indexOf("CHỜ") !== -1 || status.indexOf("WAITING") !== -1 || status.indexOf("SUBMITTED") !== -1) {
-      pendingList.push({
-        id: data[i][0] || data[i][1],
-        title: data[i][1] || data[i][2],
-        author: data[i][2] || data[i][4],
-        dept: data[i][4] || data[i][3]
-      });
+      var docAuthor = String(data[i][2] || data[i][4] || "").trim().toLowerCase();
+      var docApprover = String(data[i][5] || "").trim().toLowerCase();
+      var docDept = String(data[i][4] || data[i][3] || "").trim().toLowerCase();
+
+      var canView = isBGH ||
+                    (teacherDept && docDept && teacherDept === docDept) ||
+                    (teacherFull && (docAuthor === teacherFull || docApprover === teacherFull)) ||
+                    (teacherShort && (docAuthor === teacherShort || docApprover === teacherShort));
+
+      if (canView) {
+        pendingList.push({
+          id: String(data[i][0] || data[i][1] || ""),
+          title: String(data[i][1] || data[i][2] || ""),
+          author: String(data[i][2] || data[i][4] || ""),
+          dept: String(data[i][4] || data[i][3] || "")
+        });
+      }
     }
   }
 
@@ -1687,8 +2437,8 @@ function handleLookupPendingDocuments(chatId) {
             "╚════════════════════════════════════════╝\n\n";
 
   for (var k = 0; k < Math.min(pendingList.length, 5); k++) {
-    msg += (k + 1) + ". [" + pendingList[k].id + "] " + pendingList[k].title + "\n" +
-           "   👤 " + pendingList[k].author + " (" + (pendingList[k].dept || "Bộ môn") + ")\n\n";
+    msg += (k + 1) + ". [" + escapeZaloMarkdown(pendingList[k].id) + "] " + escapeZaloMarkdown(pendingList[k].title) + "\n" +
+           "   👤 " + escapeZaloMarkdown(pendingList[k].author) + " (" + escapeZaloMarkdown(pendingList[k].dept || "Bộ môn") + ")\n\n";
   }
 
   msg += "👉 Kính mời Quý Thầy/Cô vào EduSign để phê duyệt.";
@@ -1699,13 +2449,22 @@ function handleLookupPendingDocuments(chatId) {
 // 🔗 12. HÀM MAPPING SỐ ĐIỆN THOẠI -> ZALO CHAT ID
 // ====================================================================================================
 function handlePhoneMapping(chatId, phoneInput) {
+  if (!chatId || !phoneInput) {
+    return "⚠️ Thiếu thông tin liên kết số điện thoại. Vui lòng thử lại!";
+  }
   var ss = getDatabaseSpreadsheet();
+  if (!ss) {
+    return "⚠️ Hệ thống không thể kết nối đến cơ sở dữ liệu. Vui lòng liên hệ Quản trị viên!";
+  }
   var sheet = ss.getSheetByName(CONFIG.SHEET_USERS);
   if (!sheet) {
     return "⚠️ Hệ thống chưa tìm thấy bảng 'Danh bạ GV'. Vui lòng báo Quản trị viên!";
   }
 
   var data = sheet.getDataRange().getValues();
+  if (!Array.isArray(data) || data.length === 0) {
+    return "⚠️ Dữ liệu danh bạ giáo viên hiện đang trống.";
+  }
   var normPhone = normalizePhone(phoneInput);
   var matchedRow = -1;
   var teacherName = "";
@@ -1713,6 +2472,7 @@ function handlePhoneMapping(chatId, phoneInput) {
   var shortName = "";
 
   for (var i = 1; i < data.length; i++) {
+    if (!Array.isArray(data[i])) continue;
     var rowPhone = normalizePhone(String(data[i][2]));
     if (rowPhone === normPhone) {
       matchedRow = i + 1;
@@ -1729,36 +2489,44 @@ function handlePhoneMapping(chatId, phoneInput) {
 
     // Tự động tìm tên viết tắt TKB nếu chưa có
     if (!shortName) {
-      var schoolData = fetchSchoolTimetableData();
-      if (schoolData && schoolData.teachers) {
-        var tObj = findMatchingTeacher(teacherName, schoolData.teachers);
-        if (tObj && tObj.shortName) {
-          sheet.getRange(matchedRow, 8).setValue(tObj.shortName);
+      try {
+        var schoolData = fetchSchoolTimetableData();
+        if (schoolData && schoolData.teachers) {
+          var tObj = findMatchingTeacher(teacherName, schoolData.teachers);
+          if (tObj && tObj.shortName) {
+            sheet.getRange(matchedRow, 8).setValue(tObj.shortName);
+          }
         }
+      } catch (eFind) {
+        // Bỏ qua lỗi tìm tên viết tắt, không làm gián đoạn liên kết
       }
     }
 
     return "🎉 LIÊN KẾT ZALO THÀNH CÔNG!\n\n" +
-           "👤 Họ và Tên: " + teacherName + "\n" +
-           "🏫 Đơn vị: " + department + "\n" +
-           "📱 Số điện thoại: " + phoneInput + "\n\n" +
+           "👤 Họ và Tên: " + escapeZaloMarkdown(teacherName) + "\n" +
+           "🏫 Đơn vị: " + escapeZaloMarkdown(department) + "\n" +
+           "📱 Số điện thoại: " + escapeZaloMarkdown(phoneInput) + "\n\n" +
            "✅ TỪ BÂY GIỜ THẦY/CÔ SẼ TỰ ĐỘNG NHẬN:\n" +
            "1️⃣ 🌅 Tin nhắn nhắc lịch giảng dạy chi tiết lúc 6h00 sáng mỗi ngày.\n" +
            "2️⃣ 🔔 Thông báo tức thì khi có hồ sơ trình ký, giáo án được ký duyệt hoặc bị trả về.\n" +
            "3️⃣ 📅 Tra cứu nhanh: Chỉ cần gõ 'tkb' là xem được lịch dạy cá nhân ngay lập tức!";
   } else {
-    return "⚠️ Số điện thoại [" + phoneInput + "] không có trong danh bạ cán bộ - giáo viên nhà trường.\n" +
+    return "⚠️ Số điện thoại [" + escapeZaloMarkdown(phoneInput) + "] không có trong danh bạ cán bộ - giáo viên nhà trường.\n" +
            "Vui lòng kiểm tra lại hoặc liên hệ Văn thư nhà trường để cập nhật số điện thoại chính xác!";
   }
 }
 
 function handleUnlinkPhone(chatId) {
+  if (!chatId) return "⚠️ Thiếu thông tin tài khoản Zalo.";
   var ss = getDatabaseSpreadsheet();
+  if (!ss) return "⚠️ Hệ thống không thể kết nối đến cơ sở dữ liệu.";
   var sheet = ss.getSheetByName(CONFIG.SHEET_USERS);
   if (!sheet) return "⚠️ Dữ liệu chưa sẵn sàng.";
 
   var data = sheet.getDataRange().getValues();
+  if (!Array.isArray(data)) return "⚠️ Dữ liệu không hợp lệ.";
   for (var i = 1; i < data.length; i++) {
+    if (!Array.isArray(data[i])) continue;
     if (String(data[i][5]) === String(chatId)) {
       sheet.getRange(i + 1, 6).setValue("");
       return "✅ Đã hủy liên kết Zalo thành công. Thầy/Cô có thể gửi lại Số điện thoại mới bất cứ lúc nào.";
@@ -1768,7 +2536,9 @@ function handleUnlinkPhone(chatId) {
 }
 
 function getTeacherProfileByChatId(chatId) {
+  if (!chatId) return null;
   var ss = getDatabaseSpreadsheet();
+  if (!ss) return null;
   var sheet = ss.getSheetByName(CONFIG.SHEET_USERS);
   if (!sheet) return null;
 
@@ -1790,7 +2560,9 @@ function getTeacherProfileByChatId(chatId) {
 // 📊 13. TRA CỨU TRẠNG THÁI HỒ SƠ 1-CHẠM QUA ZALO
 // ====================================================================================================
 function handleLookupTeacherReports(chatId) {
+  if (!chatId) return "⚠️ Thiếu thông tin tài khoản Zalo.";
   var ss = getDatabaseSpreadsheet();
+  if (!ss) return "⚠️ Hệ thống không thể kết nối đến cơ sở dữ liệu.";
   var sheetUsers = ss.getSheetByName(CONFIG.SHEET_USERS);
   var sheetReports = ss.getSheetByName(CONFIG.SHEET_REPORTS);
 
@@ -1802,41 +2574,43 @@ function handleLookupTeacherReports(chatId) {
   }
 
   var reportsData = sheetReports.getDataRange().getValues();
+  if (!Array.isArray(reportsData)) return "⚠️ Dữ liệu báo cáo không hợp lệ.";
   var myReports = [];
 
   for (var j = reportsData.length - 1; j >= 1; j--) {
     var row = reportsData[j];
-    var author = String(row[2] || "");
+    if (!Array.isArray(row)) continue;
+    var author = String(row[2] || "").trim();
     var phone = normalizePhone(String(row[3] || ""));
 
     if ((teacher.phone && phone === teacher.phone) || (teacher.fullName && author.toLowerCase().indexOf(teacher.fullName.toLowerCase()) !== -1)) {
       myReports.push({
-        id: row[0],
-        title: row[1],
-        approver: row[5],
-        date: row[6],
-        status: row[7],
-        viewUrl: row[8]
+        id: String(row[0] || ""),
+        title: String(row[1] || ""),
+        approver: String(row[5] || ""),
+        date: String(row[6] || ""),
+        status: String(row[7] || ""),
+        viewUrl: String(row[8] || "")
       });
       if (myReports.length >= 5) break;
     }
   }
 
   if (myReports.length === 0) {
-    return "📋 Kính chào Thầy/Cô " + teacher.fullName + "!\n" +
+    return "📋 Kính chào Thầy/Cô " + escapeZaloMarkdown(teacher.fullName || "") + "!\n" +
            "Hiện tại chưa có báo cáo chuyên môn nào của Thầy/Cô được lưu trữ trên hệ thống.\n\n" +
            "🌐 Xem cổng báo cáo chung: " + CONFIG.PORTAL_URL;
   }
 
-  var msg = "📋 CÁC BÁO CÁO GẦN NHẤT CỦA THẦY/CÔ (" + teacher.fullName + "):\n";
+  var msg = "📋 CÁC BÁO CÁO GẦN NHẤT CỦA THẦY/CÔ (" + escapeZaloMarkdown(teacher.fullName || "") + "):\n";
   msg += "════════════════════════════════════════\n\n";
 
   for (var k = 0; k < myReports.length; k++) {
     var r = myReports[k];
     var statusIcon = (r.status === "ĐÃ KÝ DUYỆT & ĐÓNG DẤU" || r.status === "COMPLETED") ? "✅" : (r.status === "BỊ TRẢ VỀ" ? "⚠️" : "⏳");
-    msg += (k + 1) + ". " + statusIcon + " " + r.title + "\n";
-    msg += "   • Trạng thái: " + r.status + "\n";
-    msg += "   • Ngày: " + (r.date || "N/A") + "\n";
+    msg += (k + 1) + ". " + statusIcon + " " + escapeZaloMarkdown(r.title) + "\n";
+    msg += "   • Trạng thái: " + escapeZaloMarkdown(r.status) + "\n";
+    msg += "   • Ngày: " + escapeZaloMarkdown(r.date || "N/A") + "\n";
     if (r.viewUrl) msg += "   • Link xem: " + r.viewUrl + "\n";
     msg += "\n";
   }
@@ -1849,16 +2623,24 @@ function handleLookupTeacherReports(chatId) {
 // 🔔 14. XỬ LÝ SỰ KIỆN TỪ SERVER KÝ SỐ EDUSIGN
 // ====================================================================================================
 function handleEduSignNotification(data) {
-  const eventType = data.eventType;
-  const docTitle = data.docTitle || "Báo cáo chuyên môn";
-  const docId = data.docId || "";
+  if (!data || typeof data !== "object") {
+    return {
+      success: false,
+      delivered: false,
+      reason: "INVALID_PAYLOAD",
+      error: "Payload không hợp lệ"
+    };
+  }
+  const eventType = String(data.eventType || "");
+  const docTitle = String(data.docTitle || "Báo cáo chuyên môn");
+  const docId = String(data.docId || "");
   const authorPhone = normalizePhone(data.authorPhone || "");
   const recipientPhone = normalizePhone(data.recipientPhone || "");
-  const recipientName = data.recipientName || "Người duyệt";
-  const senderName = data.senderName || "Giáo viên";
-  const approverName = data.approverName || "Ban Giám hiệu";
-  const reason = data.reason || "";
-  const viewUrl = data.viewUrl || CONFIG.PORTAL_URL;
+  const recipientName = String(data.recipientName || "Người duyệt");
+  const senderName = String(data.senderName || "Giáo viên");
+  const approverName = String(data.approverName || "Ban Giám hiệu");
+  const reason = String(data.reason || "");
+  const viewUrl = String(data.viewUrl || CONFIG.PORTAL_URL);
 
   let messageText = "";
   let targetPhone = "";
@@ -1934,10 +2716,10 @@ function handleEduSignNotification(data) {
                       "⏰ Thời gian: " + nowStr + "\n\n" +
                       "📌 Hệ thống đã tự động ghi nhận và chuyển tiếp hồ sơ trong luồng ký số điện tử.";
       replyAuthor = sendZaloBotReply(authorChatId, authorMsg);
-      if (replyAuthor && replyAuthor.success === false) {
-        authorNote = replyAuthor.error || "BOT_SEND_FAILED";
-      } else {
+      if (replyAuthor && replyAuthor.success === true) {
         authorDelivered = true;
+      } else {
+        authorNote = (replyAuthor && replyAuthor.error) || "BOT_SEND_FAILED";
       }
     } else {
       authorNote = authorPhone ? "CHUA_LIEN_KET_ZALO" : "NO_AUTHOR_PHONE";
@@ -1958,10 +2740,10 @@ function handleEduSignNotification(data) {
                         "⏰ Thời gian gửi: " + nowStr + "\n\n" +
                         "👉 Kính mời Quý Thầy/Cô vào phần mềm EduSign để kiểm tra và ký duyệt.";
       replyApprover = sendZaloBotReply(recipientChatId, approverMsg);
-      if (replyApprover && replyApprover.success === false) {
-        recipientNote = replyApprover.error || "BOT_SEND_FAILED";
-      } else {
+      if (replyApprover && replyApprover.success === true) {
         recipientDelivered = true;
+      } else {
+        recipientNote = (replyApprover && replyApprover.error) || "BOT_SEND_FAILED";
       }
     } else {
       // Graceful fallback: If recipientPhone is NOT linked to Zalo (!approverChatId), DO NOT crash or abort author's delivery!
@@ -1971,15 +2753,15 @@ function handleEduSignNotification(data) {
 
     var isDelivered = Boolean(authorDelivered || recipientDelivered);
 
-    if (!isDelivered && (replyApprover && replyApprover.statusCode || replyAuthor && replyAuthor.statusCode)) {
-      var activeReply = (replyApprover && replyApprover.statusCode) ? replyApprover : replyAuthor;
+    if (!isDelivered && ((replyApprover && (replyApprover.success === false || replyApprover.statusCode)) || (replyAuthor && (replyAuthor.success === false || replyAuthor.statusCode)))) {
+      var failedReply = (replyApprover && (replyApprover.success === false || replyApprover.statusCode)) ? replyApprover : replyAuthor;
       return {
         success: false,
         delivered: false,
         phone: recipientPhone || authorPhone,
         chatId: recipientChatId || authorChatId,
-        statusCode: activeReply.statusCode,
-        error: activeReply.error || "BOT_SEND_FAILED"
+        statusCode: failedReply.statusCode,
+        error: failedReply.error || "BOT_SEND_FAILED"
       };
     }
 
@@ -2028,10 +2810,10 @@ function handleEduSignNotification(data) {
                       "⏰ Thời gian: " + nowStr + "\n\n" +
                       "📌 Hệ thống đã tự động ghi nhận và chuyển tiếp hồ sơ trong luồng ký số điện tử.";
       replyAuthor = sendZaloBotReply(authorChatId, authorMsg);
-      if (replyAuthor && replyAuthor.success === false) {
-        authorNote = replyAuthor.error || "BOT_SEND_FAILED";
-      } else {
+      if (replyAuthor && replyAuthor.success === true) {
         authorDelivered = true;
+      } else {
+        authorNote = (replyAuthor && replyAuthor.error) || "BOT_SEND_FAILED";
       }
     } else {
       authorNote = authorPhone ? "CHUA_LIEN_KET_ZALO" : "NO_AUTHOR_PHONE";
@@ -2052,10 +2834,10 @@ function handleEduSignNotification(data) {
                         "⏰ Thời gian gửi: " + nowStr + "\n\n" +
                         "👉 Kính mời Thầy/Cô truy cập EduSign để kiểm tra và tiếp tục ký phối hợp.";
       replyApprover = sendZaloBotReply(recipientChatId, approverMsg);
-      if (replyApprover && replyApprover.success === false) {
-        recipientNote = replyApprover.error || "BOT_SEND_FAILED";
-      } else {
+      if (replyApprover && replyApprover.success === true) {
         recipientDelivered = true;
+      } else {
+        recipientNote = (replyApprover && replyApprover.error) || "BOT_SEND_FAILED";
       }
     } else {
       recipientNote = recipientPhone ? "CHUA_LIEN_KET_ZALO" : "NO_RECIPIENT_PHONE";
@@ -2064,15 +2846,15 @@ function handleEduSignNotification(data) {
 
     var isDelivered = Boolean(authorDelivered || recipientDelivered);
 
-    if (!isDelivered && (replyApprover && replyApprover.statusCode || replyAuthor && replyAuthor.statusCode)) {
-      var activeReply = (replyApprover && replyApprover.statusCode) ? replyApprover : replyAuthor;
+    if (!isDelivered && ((replyApprover && (replyApprover.success === false || replyApprover.statusCode)) || (replyAuthor && (replyAuthor.success === false || replyAuthor.statusCode)))) {
+      var failedReply = (replyApprover && (replyApprover.success === false || replyApprover.statusCode)) ? replyApprover : replyAuthor;
       return {
         success: false,
         delivered: false,
         phone: recipientPhone || authorPhone,
         chatId: recipientChatId || authorChatId,
-        statusCode: activeReply.statusCode,
-        error: activeReply.error || "BOT_SEND_FAILED"
+        statusCode: failedReply.statusCode,
+        error: failedReply.error || "BOT_SEND_FAILED"
       };
     }
 
@@ -2118,10 +2900,21 @@ function handleEduSignNotification(data) {
   return { success: false, reason: "INVALID_EVENT" };
 }
 
+function sanitizeSpreadsheetText(val) {
+  var s = String(val || "").trim();
+  if (/^[=+\-@]/.test(s)) {
+    return "'" + s;
+  }
+  return s;
+}
+
 // ====================================================================================================
 // 👥 14.1 TỰ ĐỘNG ĐỒNG BỘ THÔNG TIN GIÁO VIÊN VÀO GOOGLE SHEET "Danh bạ GV" & MÃ PIN
 // ====================================================================================================
 function handleSyncTeacher(postData) {
+  if (!postData || typeof postData !== "object") {
+    return { success: false, error: "Payload thông tin giáo viên không hợp lệ" };
+  }
   try {
     var ss = getDatabaseSpreadsheet();
     if (!ss) {
@@ -2139,19 +2932,21 @@ function handleSyncTeacher(postData) {
 
     // Đảm bảo tiêu đề cột 9 là "Mã PIN"
     var headerRow = sheetUsers.getRange(1, 1, 1, Math.max(sheetUsers.getLastColumn(), 9)).getValues()[0];
-    if (!headerRow[8] || String(headerRow[8]).trim() === "") {
+    if (!headerRow || !headerRow[8] || String(headerRow[8]).trim() === "") {
       sheetUsers.getRange(1, 9).setValue("Mã PIN")
         .setBackground("#1e40af")
         .setFontColor("#ffffff")
         .setFontWeight("bold");
     }
 
-    var t = postData.teacher || postData;
+    var rawT = (postData && typeof postData.teacher === "object" && postData.teacher !== null) ? postData.teacher : postData;
+    var t = (rawT && typeof rawT === "object") ? rawT : {};
     var fullName = String(t.fullName || t.name || "").trim();
     var phone = String(t.phone || "").trim();
     var department = String(t.department || t.departmentName || "").trim();
     var email = String(t.email || "").trim();
-    var pinCode = String(t.pinCode || t.pin || "").trim();
+    var rawPin = String(t.pinCode || t.pin || "").replace(/^'+/, "").trim();
+    var pinCode = rawPin;
     var shortName = String(t.shortName || t.tkbName || "").trim();
 
     if (!fullName && !phone) {
@@ -2168,15 +2963,41 @@ function handleSyncTeacher(postData) {
     var normPhone = normalizePhone(phone);
     var finalPhone = normPhone || String(phone || "").replace(/^'+/, "").trim();
 
-    if (!pinCode && finalPhone.length >= 4) {
-      pinCode = finalPhone.slice(-4);
-    }
     if (!pinCode) {
-      pinCode = "1234";
+      // Triệt tiêu mã PIN mặc định: Khởi tạo ngẫu nhiên bảo mật 6 chữ số từ nguồn entropy hệ thống (không dùng Date.now)
+      var digits = "";
+      for (var attempt = 0; attempt < 5 && digits.length < 6; attempt++) {
+        var rawUuid = "";
+        if (typeof Utilities !== "undefined" && typeof Utilities.getUuid === "function") {
+          rawUuid = Utilities.getUuid();
+        } else {
+          try {
+            var cryptoObj = typeof require === "function" ? require("crypto") : null;
+            if (cryptoObj && typeof cryptoObj.randomBytes === "function") {
+              rawUuid = cryptoObj.randomBytes(16).toString("hex");
+            }
+          } catch (eCrypto) {
+            Logger.log("Crypto random note: " + eCrypto);
+          }
+        }
+        digits += String(rawUuid || "").replace(/\D/g, "");
+      }
+
+      if (digits.length < 6) {
+        return { success: false, error: "Không thể khởi tạo mã PIN ngẫu nhiên bảo mật. Vui lòng cung cấp pinCode hợp lệ!" };
+      }
+      pinCode = digits.slice(0, 6);
     }
     var pinClean = String(pinCode).replace(/^'+/, "").trim();
     if (/^\d+$/.test(pinClean) && pinClean.length < 4) {
       pinClean = pinClean.padStart(4, "0");
+    }
+    if (!/^\d{4,8}$/.test(pinClean)) {
+      return { success: false, error: "Mã PIN không hợp lệ. PIN phải gồm từ 4 đến 8 chữ số!" };
+    }
+
+    if (!sheetUsers || typeof sheetUsers.getDataRange !== "function") {
+      return { success: false, error: "Không tìm thấy Sheet Danh bạ GV hoặc bảng tính không hợp lệ" };
     }
 
     try {
@@ -2185,9 +3006,20 @@ function handleSyncTeacher(postData) {
         sheetUsers.getRange("F:F").setNumberFormat("@");
         sheetUsers.getRange("I:I").setNumberFormat("@");
       }
-    } catch (eFmt) {}
+    } catch (eFmt) {
+      Logger.log("Format range note: " + eFmt);
+    }
 
-    var data = sheetUsers.getDataRange().getValues();
+    var data = [];
+    try {
+      data = sheetUsers.getDataRange().getValues();
+    } catch (eData) {
+      Logger.log("Lỗi đọc dữ liệu sheetUsers: " + eData);
+      return { success: false, error: "Không thể đọc dữ liệu từ bảng Danh bạ GV" };
+    }
+    if (!Array.isArray(data) || data.length === 0) {
+      return { success: false, error: "Dữ liệu danh bạ giáo viên trống hoặc không hợp lệ" };
+    }
     var matchedRow = -1;
 
     // 1. Tìm theo Số điện thoại trước
@@ -2214,43 +3046,60 @@ function handleSyncTeacher(postData) {
     }
 
     if (matchedRow !== -1) {
-      // Cập nhật dòng đã có
-      if (fullName) sheetUsers.getRange(matchedRow, 2).setValue(fullName);
-      if (finalPhone) {
-        var cellP = sheetUsers.getRange(matchedRow, 3);
-        try { if (typeof cellP.setNumberFormat === "function") cellP.setNumberFormat("@"); } catch (e) {}
-        cellP.setValue("'" + finalPhone);
-      }
-      if (department) sheetUsers.getRange(matchedRow, 4).setValue(department);
-      if (email) sheetUsers.getRange(matchedRow, 5).setValue(email);
-      if (shortName) sheetUsers.getRange(matchedRow, 8).setValue(shortName);
-      if (pinClean) {
-        var cellPin = sheetUsers.getRange(matchedRow, 9);
-        try { if (typeof cellPin.setNumberFormat === "function") cellPin.setNumberFormat("@"); } catch (e) {}
-        cellPin.setValue("'" + pinClean);
-      }
+      var safeFullName = sanitizeSpreadsheetText(fullName);
+      var safeDept = sanitizeSpreadsheetText(department);
+      var safeEmail = sanitizeSpreadsheetText(email);
+      var safeShortName = sanitizeSpreadsheetText(shortName);
 
-      Logger.log("✅ Đã cập nhật giáo viên dòng " + matchedRow + ": " + fullName + " (" + finalPhone + ") - PIN: " + pinClean);
-      return {
-        success: true,
-        action_performed: "UPDATED",
-        row: matchedRow,
-        message: "Cập nhật thành công thông tin giáo viên [" + fullName + "] trên Google Sheet"
-      };
+      // Cập nhật dòng đã có trong khối try-catch an toàn
+      try {
+        if (fullName) sheetUsers.getRange(matchedRow, 2).setValue(safeFullName);
+        if (finalPhone) {
+          var cellP = sheetUsers.getRange(matchedRow, 3);
+          try { if (typeof cellP.setNumberFormat === "function") cellP.setNumberFormat("@"); } catch (e) { Logger.log("Cell format note: " + e); }
+          cellP.setValue("'" + finalPhone);
+        }
+        if (department) sheetUsers.getRange(matchedRow, 4).setValue(safeDept);
+        if (email) sheetUsers.getRange(matchedRow, 5).setValue(safeEmail);
+        if (shortName) sheetUsers.getRange(matchedRow, 8).setValue(safeShortName);
+        if (pinClean) {
+          var cellPin = sheetUsers.getRange(matchedRow, 9);
+          try { if (typeof cellPin.setNumberFormat === "function") cellPin.setNumberFormat("@"); } catch (e) { Logger.log("Cell format note: " + e); }
+          cellPin.setValue("'" + pinClean);
+        }
+
+        Logger.log("✅ Đã cập nhật giáo viên dòng " + matchedRow + ": " + safeFullName + " (" + finalPhone + ") - PIN: [REDACTED]");
+        return {
+          success: true,
+          action_performed: "UPDATED",
+          row: matchedRow,
+          message: "Cập nhật thành công thông tin giáo viên [" + safeFullName + "] trên Google Sheet"
+        };
+      } catch (eUpdate) {
+        Logger.log("❌ Lỗi khi cập nhật ô giáo viên: " + eUpdate);
+        return {
+          success: false,
+          error: "Lỗi ghi dữ liệu cập nhật giáo viên: " + (eUpdate && eUpdate.message ? eUpdate.message : String(eUpdate))
+        };
+      }
     } else {
       // Thêm mới dòng
+      var safeFullNameNew = sanitizeSpreadsheetText(fullName);
+      var safeDeptNew = sanitizeSpreadsheetText(department);
+      var safeEmailNew = sanitizeSpreadsheetText(email);
+      var safeShortNameNew = sanitizeSpreadsheetText(shortName);
       var newStt = Math.max(1, data.length);
       var phoneText = finalPhone ? ("'" + finalPhone) : "";
       var pinText = pinClean ? ("'" + pinClean) : "";
       sheetUsers.appendRow([
         newStt,
-        fullName,
+        safeFullNameNew,
         phoneText,
-        department,
-        email,
+        safeDeptNew,
+        safeEmailNew,
         "", // Zalo_Chat_ID ban đầu để trống (sẽ được điền khi GV gửi tin LK)
         "", // Ngày Liên Kết
-        shortName,
+        safeShortNameNew,
         pinText
       ]);
       try {
@@ -2260,14 +3109,16 @@ function handleSyncTeacher(postData) {
           sheetUsers.getRange(lastR, 6).setNumberFormat("@");
           sheetUsers.getRange(lastR, 9).setNumberFormat("@");
         }
-      } catch (eRowFmt) {}
+      } catch (eRowFmt) {
+        Logger.log("Row format note: " + eRowFmt);
+      }
 
-      Logger.log("✅ Đã thêm mới giáo viên vào Sheet: " + fullName + " (" + finalPhone + ") - PIN: " + pinClean);
+      Logger.log("✅ Đã thêm mới giáo viên vào Sheet: " + safeFullNameNew + " (" + finalPhone + ") - PIN: [REDACTED]");
       return {
         success: true,
         action_performed: "CREATED",
         row: data.length + 1,
-        message: "Thêm mới thành công giáo viên [" + fullName + "] vào Google Sheet"
+        message: "Thêm mới thành công giáo viên [" + safeFullNameNew + "] vào Google Sheet"
       };
     }
   } catch (err) {
@@ -2277,16 +3128,41 @@ function handleSyncTeacher(postData) {
 }
 
 function handleSyncTeachersBatch(postData) {
+  if (!postData || typeof postData !== "object" || Array.isArray(postData)) {
+    return { success: false, error: "Payload thông tin giáo viên hàng loạt không hợp lệ" };
+  }
   try {
-    var teachers = postData.teachers || [];
-    if (!Array.isArray(teachers) || teachers.length === 0) {
+    var teachers = Array.isArray(postData.teachers) ? postData.teachers : [];
+    if (teachers.length === 0) {
       return { success: false, error: "Danh sách giáo viên rỗng" };
     }
-    var results = [];
-    for (var k = 0; k < teachers.length; k++) {
-      results.push(handleSyncTeacher({ teacher: teachers[k] }));
+    if (teachers.length > 500) {
+      return { success: false, error: "Số lượng giáo viên vượt quá giới hạn cho phép (tối đa 500)" };
     }
-    return { success: true, count: results.length, details: results };
+    var results = [];
+    var hasFailure = false;
+    for (var k = 0; k < teachers.length; k++) {
+      var tItem = teachers[k];
+      if (!tItem || typeof tItem !== "object" || Array.isArray(tItem)) {
+        results.push({ success: false, index: k, error: "Dữ liệu giáo viên không hợp lệ tại vị trí " + k });
+        hasFailure = true;
+        continue;
+      }
+      var res = handleSyncTeacher({ teacher: tItem });
+      if (!res || res.success !== true) {
+        hasFailure = true;
+      }
+      results.push(res);
+    }
+    var passedCount = results.filter(function(r) { return r && r.success === true; }).length;
+    var allPassed = (passedCount === teachers.length && !hasFailure);
+    return {
+      success: allPassed,
+      total: teachers.length,
+      passedCount: passedCount,
+      failedCount: teachers.length - passedCount,
+      details: results
+    };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -2296,224 +3172,452 @@ function handleSyncTeachersBatch(postData) {
 // 📁 15. LƯU TRỮ BÁO CÁO VÀO GOOGLE DRIVE & GOOGLE SHEETS
 // ====================================================================================================
 function handleReportArchive(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return { success: false, error: "Payload lưu trữ báo cáo không hợp lệ" };
+  }
   try {
+    var safeData = (data && typeof data === "object" && !Array.isArray(data)) ? data : {};
     var ss = getDatabaseSpreadsheet();
+    if (!ss) {
+      return { success: false, error: "Không thể mở bảng tính cơ sở dữ liệu" };
+    }
     var sheet = ss.getSheetByName(CONFIG.SHEET_REPORTS);
     if (!sheet) {
       return { success: false, error: "Khong tim thay Sheet So Luu Bao Cao" };
     }
 
-    var docId = data.docId || ("BC-" + Date.now());
-    var title = data.title || "Báo cáo chuyên môn";
-    var author = data.author || "Giáo viên";
-    var authorPhone = normalizePhone(data.authorPhone || "");
-    var department = data.department || "Tổ chuyên môn";
-    var approver = data.approver || "Ban Giám hiệu";
-    var signDate = data.signDate || new Date().toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" });
-    var status = data.status || "ĐÃ KÝ DUYỆT & ĐÓNG DẤU";
-    var note = data.note || "";
-    var fileBase64 = data.fileBase64 || "";
-    var fileName = data.fileName || (docId + "_" + title.replace(/[^a-zA-Z0-9]/g, "_") + ".pdf");
+    var rawDocId = String(safeData.docId || ("BC-" + Date.now())).trim().slice(0, 100);
+    var docId = sanitizeSpreadsheetText(rawDocId);
+    var rawTitle = String(safeData.title || "Báo cáo chuyên môn").trim().slice(0, 300);
+    var title = sanitizeSpreadsheetText(rawTitle);
+    var author = sanitizeSpreadsheetText(String(safeData.author || "Giáo viên").trim().slice(0, 150));
+    var authorPhone = sanitizeSpreadsheetText(normalizePhone(safeData.authorPhone || ""));
+    var department = sanitizeSpreadsheetText(String(safeData.department || "Tổ chuyên môn").trim().slice(0, 150));
+    var approver = sanitizeSpreadsheetText(String(safeData.approver || "Ban Giám hiệu").trim().slice(0, 150));
+    var signDate = sanitizeSpreadsheetText(String(safeData.signDate || new Date().toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" })).trim().slice(0, 100));
+    var status = sanitizeSpreadsheetText(String(safeData.status || "ĐÃ KÝ DUYỆT & ĐÓNG DẤU").trim().slice(0, 100));
+    var note = sanitizeSpreadsheetText(String(safeData.note || "").trim().slice(0, 500));
 
-    var viewUrl = data.viewUrl || "";
-    var downloadUrl = data.downloadUrl || "";
+    var fileBase64 = (typeof safeData.fileBase64 === "string") ? safeData.fileBase64.trim() : "";
+    var rawFileName = (typeof safeData.fileName === "string" && safeData.fileName.trim().length > 0)
+      ? safeData.fileName.trim()
+      : (rawDocId + "_" + rawTitle.replace(/[^a-zA-Z0-9_\-\.\u00C0-\u024F\u1EA0-\u1EF9]/g, "_") + ".pdf");
+    var fileName = rawFileName.replace(/[\\\/:\*\?"<>\|]/g, "_").slice(0, 150);
+    if (!/\.(pdf|docx?|xlsx?|png|jpe?g)$/i.test(fileName)) {
+      fileName += ".pdf";
+    }
 
-    if (fileBase64 && (!viewUrl || viewUrl === "")) {
+    var viewUrl = (typeof safeData.viewUrl === "string" && /^https?:\/\//i.test(safeData.viewUrl.trim())) ? safeData.viewUrl.trim().slice(0, 2000) : "";
+    var downloadUrl = (typeof safeData.downloadUrl === "string" && /^https?:\/\//i.test(safeData.downloadUrl.trim())) ? safeData.downloadUrl.trim().slice(0, 2000) : "";
+
+    var lock = (typeof LockService !== "undefined" && typeof LockService.getScriptLock === "function")
+      ? LockService.getScriptLock()
+      : null;
+    var hasLock = false;
+    if (lock) {
       try {
-        var rootFolder = getOrCreateFolderHierarchy(CONFIG.DRIVE_ROOT_FOLDER);
-        var yearMonth = Utilities.formatDate(new Date(), "Asia/Ho_Chi_Minh", "yyyy/MM");
-        var targetFolder = getOrCreateFolderHierarchy(CONFIG.DRIVE_ROOT_FOLDER + "/" + yearMonth);
-
-        var decodedBytes = Utilities.base64Decode(fileBase64);
-        var blob = Utilities.newBlob(decodedBytes, "application/pdf", fileName);
-        var driveFile = targetFolder.createFile(blob);
-        driveFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-
-        viewUrl = driveFile.getUrl();
-        downloadUrl = driveFile.getDownloadUrl();
-      } catch (driveErr) {
-        Logger.log("Lỗi tải tệp lên Drive: " + driveErr.toString());
+        hasLock = lock.tryLock(10000);
+      } catch (eLock) {
+        Logger.log("Lỗi acquire script lock: " + eLock.toString());
+      }
+      if (!hasLock) {
+        return {
+          success: false,
+          error: "Hệ thống đang bận ghi nhận báo cáo đồng thời, vui lòng thử lại sau giây lát"
+        };
       }
     }
 
-    // Kiểm tra xem báo cáo docId này đã tồn tại trong Sheet hay chưa (tránh trùng lặp khi ký nhiều bước)
-    var dataRows = sheet.getDataRange().getValues();
-    var existingRowIndex = -1;
-    for (var r = 1; r < dataRows.length; r++) {
-      if (String(dataRows[r][0]).trim() === String(docId).trim()) {
-        existingRowIndex = r + 1; // 1-indexed trong Google Sheets
-        break;
+    try {
+      if (fileBase64 && (!viewUrl || viewUrl === "")) {
+        // Giới hạn Base64 tương ứng tối đa 35MB nhị phân (35 * 1024 * 1024 * 4 / 3)
+        var maxBase64Length = Math.floor(35 * 1024 * 1024 * 4 / 3);
+        if (fileBase64.length > maxBase64Length) {
+          return { success: false, error: "Dung lượng tệp đính kèm Base64 vượt quá giới hạn 35MB nhị phân" };
+        }
+        try {
+          var rootFolder = getOrCreateFolderHierarchy(CONFIG.DRIVE_ROOT_FOLDER);
+          var yearMonth = Utilities.formatDate(new Date(), "Asia/Ho_Chi_Minh", "yyyy/MM");
+          var targetFolder = getOrCreateFolderHierarchy(CONFIG.DRIVE_ROOT_FOLDER + "/" + yearMonth);
+
+          var extMatch = fileName.match(/\.([a-zA-Z0-9]+)$/);
+          var fileExt = extMatch ? extMatch[1].toLowerCase() : "pdf";
+          var mimeMap = {
+            "pdf": "application/pdf",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "doc": "application/msword",
+            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "xls": "application/vnd.ms-excel",
+            "png": "image/png",
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg"
+          };
+          var fileMimeType = mimeMap[fileExt] || "application/pdf";
+
+          var decodedBytes = Utilities.base64Decode(fileBase64);
+          var blob = Utilities.newBlob(decodedBytes, fileMimeType, fileName);
+          var driveFile = targetFolder.createFile(blob);
+          try {
+            if (safeData.isPublic === true && typeof DriveApp !== "undefined" && DriveApp.Access) {
+              if (DriveApp.Access.DOMAIN_WITH_LINK) {
+                driveFile.setSharing(DriveApp.Access.DOMAIN_WITH_LINK, DriveApp.Permission.VIEW);
+              } else if (DriveApp.Access.ANYONE_WITH_LINK) {
+                driveFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+              }
+            }
+          } catch (eShare) {
+            Logger.log("Lưu ý phân quyền chia sẻ Drive: " + eShare.toString());
+          }
+
+          viewUrl = driveFile.getUrl();
+          downloadUrl = driveFile.getDownloadUrl();
+        } catch (driveErr) {
+          Logger.log("Lỗi tải tệp lên Drive: " + driveErr.toString());
+        }
+      }
+
+      // Kiểm tra xem báo cáo docId này đã tồn tại trong Sheet hay chưa (tránh trùng lặp khi ký nhiều bước)
+      var dataRows = (sheet && typeof sheet.getDataRange === "function") ? sheet.getDataRange().getValues() : [];
+      var existingRowIndex = -1;
+      if (Array.isArray(dataRows)) {
+        for (var r = 1; r < dataRows.length; r++) {
+          if (Array.isArray(dataRows[r]) && String(dataRows[r][0] || "").trim() === String(docId).trim()) {
+            existingRowIndex = r + 1; // 1-indexed trong Google Sheets
+            break;
+          }
+        }
+      }
+
+      var rowValues = [
+        sanitizeSpreadsheetText(docId),
+        sanitizeSpreadsheetText(title),
+        sanitizeSpreadsheetText(author),
+        sanitizeSpreadsheetText(authorPhone),
+        sanitizeSpreadsheetText(department),
+        sanitizeSpreadsheetText(approver),
+        sanitizeSpreadsheetText(signDate),
+        sanitizeSpreadsheetText(status),
+        sanitizeSpreadsheetText(viewUrl),
+        sanitizeSpreadsheetText(downloadUrl),
+        sanitizeSpreadsheetText(note)
+      ];
+
+      if (existingRowIndex > 0) {
+        // CẬP NHẬT đè lên dòng đã có: cập nhật trạng thái mới nhất, người duyệt mới nhất, ngày giờ mới nhất
+        sheet.getRange(existingRowIndex, 1, 1, 11).setValues([rowValues]);
+      } else {
+        sheet.appendRow(rowValues);
+      }
+
+      return {
+        success: true,
+        docId: docId,
+        viewUrl: viewUrl,
+        downloadUrl: downloadUrl,
+        updated: (existingRowIndex > 0),
+        message: (existingRowIndex > 0) ? "Đã cập nhật trạng thái báo cáo thành công!" : "Lưu trữ báo cáo thành công!"
+      };
+    } finally {
+      if (lock && hasLock) {
+        try {
+          lock.releaseLock();
+        } catch (eRel) {
+          Logger.log("Lỗi release lock: " + eRel.toString());
+        }
       }
     }
-
-    if (existingRowIndex > 0) {
-      // CẬP NHẬT đè lên dòng đã có: cập nhật trạng thái mới nhất, người duyệt mới nhất, ngày giờ mới nhất
-      sheet.getRange(existingRowIndex, 1, 1, 11).setValues([[
-        docId, title, author, authorPhone, department,
-        approver, signDate, status, viewUrl, downloadUrl, note
-      ]]);
-    } else {
-      sheet.appendRow([
-        docId, title, author, authorPhone, department,
-        approver, signDate, status, viewUrl, downloadUrl, note
-      ]);
-    }
-
-    return {
-      success: true,
-      docId: docId,
-      viewUrl: viewUrl,
-      downloadUrl: downloadUrl,
-      updated: (existingRowIndex > 0),
-      message: (existingRowIndex > 0) ? "Đã cập nhật trạng thái báo cáo thành công!" : "Lưu trữ báo cáo thành công!"
-    };
   } catch (err) {
     return { success: false, error: err.toString() };
   }
 }
 
 function fetchReportsFromSheet(params) {
-  var ss = getDatabaseSpreadsheet();
-  var sheet = ss.getSheetByName(CONFIG.SHEET_REPORTS);
-  if (!sheet) return { total: 0, page: 1, limit: 10, data: [] };
+  try {
+    params = (params && typeof params === "object" && !Array.isArray(params)) ? params : {};
+    var ss = getDatabaseSpreadsheet();
+    if (!ss) return { total: 0, page: 1, limit: 10, data: [] };
+    var sheet = ss.getSheetByName(CONFIG.SHEET_REPORTS);
+    if (!sheet) return { total: 0, page: 1, limit: 10, data: [] };
 
-  var data = sheet.getDataRange().getValues();
-  var search = (params.search || "").toLowerCase().trim();
-  var authorFilter = (params.author || "").toLowerCase().trim();
-  var deptFilter = (params.dept || "").toLowerCase().trim();
-  var statusFilter = (params.status || "").toLowerCase().trim();
-  var page = parseInt(params.page || "1", 10);
-  var limit = parseInt(params.limit || "10", 10);
+    var data = (typeof sheet.getDataRange === "function") ? sheet.getDataRange().getValues() : [];
+    if (!Array.isArray(data)) return { total: 0, page: 1, limit: 10, data: [] };
 
-  // Gom theo docId duy nhất để loại bỏ hoàn toàn các bản ghi trùng lặp trong quá khứ
-  var seenDocIds = {};
-  var filtered = [];
+    var search = String(params.search == null ? "" : params.search).toLowerCase().trim();
+    var authorFilter = String(params.author == null ? "" : params.author).toLowerCase().trim();
+    var deptFilter = String(params.dept == null ? "" : params.dept).toLowerCase().trim();
+    var statusFilter = String(params.status == null ? "" : params.status).toLowerCase().trim();
+    var rawPage = parseInt(params.page || "1", 10);
+    var page = (!isNaN(rawPage) && rawPage > 0) ? rawPage : 1;
+    var rawLimit = parseInt(params.limit || "10", 10);
+    var limit = (!isNaN(rawLimit) && rawLimit > 0 && rawLimit <= 100) ? rawLimit : 10;
 
-  for (var i = data.length - 1; i >= 1; i--) {
-    var row = data[i];
-    var docId = String(row[0] || "").trim();
-    if (!docId) continue;
-    if (seenDocIds[docId]) continue; // Đã lấy bản ghi mới nhất ở dưới cùng
-    seenDocIds[docId] = true;
+    // Bước 1: Trích xuất bản ghi mới nhất cho từng docId duy nhất (duyệt từ dưới lên trên)
+    var seenDocIds = {};
+    var latestReports = [];
 
-    var title = String(row[1] || "");
-    var author = String(row[2] || "");
-    var phone = String(row[3] || "");
-    var department = String(row[4] || "");
-    var approver = String(row[5] || "");
-    var date = String(row[6] || "");
-    var status = String(row[7] || "");
-    var viewUrl = String(row[8] || "");
-    var downloadUrl = String(row[9] || "");
-    var note = String(row[10] || "");
+    for (var i = data.length - 1; i >= 1; i--) {
+      var row = data[i];
+      if (!Array.isArray(row)) continue;
+      var docId = String(row[0] || "").trim();
+      if (!docId) continue;
+      if (seenDocIds[docId]) continue; // Đã lấy bản ghi mới nhất ở dưới cùng
+      seenDocIds[docId] = true;
 
-    if (search) {
-      var combined = (docId + " " + title + " " + author + " " + approver).toLowerCase();
-      if (combined.indexOf(search) === -1) continue;
+      latestReports.push({
+        docId: docId,
+        title: String(row[1] || ""),
+        author: String(row[2] || ""),
+        authorPhone: String(row[3] || ""),
+        department: String(row[4] || ""),
+        approver: String(row[5] || ""),
+        signDate: String(row[6] || ""),
+        status: String(row[7] || ""),
+        viewUrl: String(row[8] || ""),
+        downloadUrl: String(row[9] || ""),
+        note: String(row[10] || "")
+      });
     }
-    if (authorFilter && author.toLowerCase().indexOf(authorFilter) === -1) continue;
-    if (deptFilter && department.toLowerCase().indexOf(deptFilter) === -1) continue;
-    if (statusFilter && status.toLowerCase().indexOf(statusFilter) === -1) continue;
 
-    filtered.push({
-      docId: docId,
-      title: title,
-      author: author,
-      authorPhone: phone,
-      department: department,
-      approver: approver,
-      signDate: date,
-      status: status,
-      viewUrl: viewUrl,
-      downloadUrl: downloadUrl,
-      note: note
-    });
+    // Bước 2: Áp dụng các bộ lọc tìm kiếm trên danh sách bản ghi mới nhất
+    var filtered = [];
+    for (var j = 0; j < latestReports.length; j++) {
+      var item = latestReports[j];
+      if (search) {
+        var combined = (item.docId + " " + item.title + " " + item.author + " " + item.approver).toLowerCase();
+        if (combined.indexOf(search) === -1) continue;
+      }
+      if (authorFilter && item.author.toLowerCase().indexOf(authorFilter) === -1) continue;
+      if (deptFilter && item.department.toLowerCase().indexOf(deptFilter) === -1) continue;
+      if (statusFilter && item.status.toLowerCase().indexOf(statusFilter) === -1) continue;
+
+      filtered.push(item);
+    }
+
+    var startIndex = (page - 1) * limit;
+    var paginated = filtered.slice(startIndex, startIndex + limit);
+
+    return {
+      total: filtered.length,
+      page: page,
+      limit: limit,
+      data: paginated
+    };
+  } catch (err) {
+    Logger.log("Lỗi fetchReportsFromSheet: " + (err ? err.toString() : ""));
+    return { total: 0, page: 1, limit: 10, data: [], error: "Không thể tải danh sách báo cáo" };
   }
-
-  var startIndex = (page - 1) * limit;
-  var paginated = filtered.slice(startIndex, startIndex + limit);
-
-  return {
-    total: filtered.length,
-    page: page,
-    limit: limit,
-    data: paginated
-  };
 }
 
 /**
  * Xóa báo cáo khỏi Sheet lưu trữ (Chỉ dành cho Quản trị viên Admin)
  */
-function deleteReportFromSheet(docId) {
-  if (!docId) return { success: false, error: "Thiếu mã báo cáo docId" };
-  var ss = getDatabaseSpreadsheet();
-  if (!ss) return { success: false, error: "Không thể mở cơ sở dữ liệu Spreadsheet" };
-  var sheet = ss.getSheetByName(CONFIG.SHEET_REPORTS);
-  if (!sheet) return { success: false, error: "Không tìm thấy Sheet Sổ Lưu Báo Cáo" };
+function deleteReportFromSheet(docId, authPayload) {
+  var cleanDocId = String(docId || "").trim();
+  if (!cleanDocId) {
+    return { success: false, error: "Thiếu mã báo cáo docId" };
+  }
+  if (cleanDocId.length > 100) {
+    return { success: false, error: "Mã báo cáo docId không hợp lệ" };
+  }
 
-  var data = sheet.getDataRange().getValues();
-  var countDeleted = 0;
+  // Bắt buộc xác thực quyền Quản trị viên Admin
+  var keyToVerify = (typeof authPayload === "string")
+    ? authPayload
+    : (authPayload && (authPayload.adminKey || authPayload.apiKey || authPayload.key)) || "";
 
-  // Lặp ngược từ dưới lên trên để xóa sạch tất cả dòng có cùng docId
-  for (var i = data.length - 1; i >= 1; i--) {
-    if (String(data[i][0]).trim() === String(docId).trim()) {
-      sheet.deleteRow(i + 1); // 1-indexed trong Google Sheets
-      countDeleted++;
+  if (!verifyAdminApiKey(keyToVerify)) {
+    return { success: false, error: "UNAUTHORIZED_ADMIN_ACTION" };
+  }
+
+  var lock = (typeof LockService !== "undefined" && typeof LockService.getScriptLock === "function")
+    ? LockService.getScriptLock()
+    : null;
+  var hasLock = false;
+  if (lock) {
+    try {
+      hasLock = lock.tryLock(10000);
+    } catch (eLock) {
+      Logger.log("Lỗi acquire script lock delete: " + eLock.toString());
+    }
+    if (!hasLock) {
+      return { success: false, error: "Hệ thống đang bận xử lý dữ liệu đồng thời, vui lòng thử lại sau" };
     }
   }
 
-  if (countDeleted === 0) {
-    return { success: false, error: "Không tìm thấy báo cáo có mã " + docId };
-  }
+  try {
+    var ss = getDatabaseSpreadsheet();
+    if (!ss) return { success: false, error: "Không thể mở cơ sở dữ liệu Spreadsheet" };
+    var sheet = ss.getSheetByName(CONFIG.SHEET_REPORTS);
+    if (!sheet) return { success: false, error: "Không tìm thấy Sheet Sổ Lưu Báo Cáo" };
 
-  return { success: true, docId: docId, count: countDeleted, message: "Đã xóa " + countDeleted + " dòng báo cáo thành công khỏi kho lưu trữ!" };
+    var data = (typeof sheet.getDataRange === "function") ? sheet.getDataRange().getValues() : [];
+    if (!Array.isArray(data)) return { success: false, error: "Không thể đọc dữ liệu báo cáo" };
+
+    var countDeleted = 0;
+    // Lặp ngược từ dưới lên trên để xóa sạch tất cả dòng có cùng docId
+    for (var i = data.length - 1; i >= 1; i--) {
+      if (Array.isArray(data[i]) && String(data[i][0] || "").trim() === cleanDocId) {
+        sheet.deleteRow(i + 1); // 1-indexed trong Google Sheets
+        countDeleted++;
+      }
+    }
+
+    if (countDeleted === 0) {
+      return { success: false, error: "Không tìm thấy báo cáo có mã " + cleanDocId };
+    }
+
+    return {
+      success: true,
+      docId: cleanDocId,
+      count: countDeleted,
+      message: "Đã xóa " + countDeleted + " dòng báo cáo thành công khỏi kho lưu trữ!"
+    };
+  } catch (err) {
+    Logger.log("Lỗi deleteReportFromSheet: " + (err ? err.toString() : ""));
+    return { success: false, error: "Không thể xóa báo cáo" };
+  } finally {
+    if (lock && hasLock) {
+      try {
+        lock.releaseLock();
+      } catch (eRel) {
+        Logger.log("Lỗi release lock delete: " + eRel.toString());
+      }
+    }
+  }
 }
 
 /**
  * Xóa nhiều báo cáo đã chọn cùng lúc
  */
-function batchDeleteReportsFromSheet(docIds) {
+function batchDeleteReportsFromSheet(docIds, authPayload) {
   if (!docIds || !Array.isArray(docIds) || docIds.length === 0) {
     return { success: false, error: "Danh sách mã báo cáo rỗng" };
   }
-  var ss = getDatabaseSpreadsheet();
-  if (!ss) return { success: false, error: "Không thể mở cơ sở dữ liệu Spreadsheet" };
-  var sheet = ss.getSheetByName(CONFIG.SHEET_REPORTS);
-  if (!sheet) return { success: false, error: "Không tìm thấy Sheet Sổ Lưu Báo Cáo" };
-
-  var data = sheet.getDataRange().getValues();
-  var idMap = {};
-  for (var k = 0; k < docIds.length; k++) {
-    idMap[String(docIds[k]).trim()] = true;
+  if (docIds.length > 200) {
+    return { success: false, error: "Số lượng báo cáo cần xóa vượt quá giới hạn (tối đa 200)" };
   }
 
-  var countDeleted = 0;
-  for (var i = data.length - 1; i >= 1; i--) {
-    var id = String(data[i][0]).trim();
-    if (idMap[id]) {
-      sheet.deleteRow(i + 1);
-      countDeleted++;
+  // Bắt buộc xác thực quyền Quản trị viên Admin
+  var keyToVerifyBatch = (typeof authPayload === "string")
+    ? authPayload
+    : (authPayload && (authPayload.adminKey || authPayload.apiKey || authPayload.key)) || "";
+
+  if (!verifyAdminApiKey(keyToVerifyBatch)) {
+    return { success: false, error: "UNAUTHORIZED_ADMIN_ACTION" };
+  }
+
+  var lock = (typeof LockService !== "undefined" && typeof LockService.getScriptLock === "function")
+    ? LockService.getScriptLock()
+    : null;
+  var hasLock = false;
+  if (lock) {
+    try {
+      hasLock = lock.tryLock(15000);
+    } catch (eLock) {
+      Logger.log("Lỗi acquire script lock batch delete: " + eLock.toString());
+    }
+    if (!hasLock) {
+      return { success: false, error: "Hệ thống đang bận xử lý dữ liệu đồng thời, vui lòng thử lại sau" };
     }
   }
 
-  return { success: true, count: countDeleted, message: "Đã xóa thành công " + countDeleted + " báo cáo được chọn!" };
+  try {
+    var ss = getDatabaseSpreadsheet();
+    if (!ss) return { success: false, error: "Không thể mở cơ sở dữ liệu Spreadsheet" };
+    var sheet = ss.getSheetByName(CONFIG.SHEET_REPORTS);
+    if (!sheet) return { success: false, error: "Không tìm thấy Sheet Sổ Lưu Báo Cáo" };
+
+    var data = (typeof sheet.getDataRange === "function") ? sheet.getDataRange().getValues() : [];
+    if (!Array.isArray(data)) return { success: false, error: "Không thể đọc dữ liệu báo cáo" };
+
+    var idMap = {};
+    for (var k = 0; k < docIds.length; k++) {
+      var cId = String(docIds[k] || "").trim();
+      if (cId) idMap[cId] = true;
+    }
+
+    var countDeleted = 0;
+    for (var i = data.length - 1; i >= 1; i--) {
+      if (Array.isArray(data[i])) {
+        var id = String(data[i][0] || "").trim();
+        if (id && idMap[id]) {
+          sheet.deleteRow(i + 1);
+          countDeleted++;
+        }
+      }
+    }
+
+    return {
+      success: true,
+      count: countDeleted,
+      message: "Đã xóa thành công " + countDeleted + " báo cáo được chọn!"
+    };
+  } catch (err) {
+    Logger.log("Lỗi batchDeleteReportsFromSheet: " + (err ? err.toString() : ""));
+    return { success: false, error: "Không thể xóa danh sách báo cáo" };
+  } finally {
+    if (lock && hasLock) {
+      try {
+        lock.releaseLock();
+      } catch (eRel) {
+        Logger.log("Lỗi release lock batch delete: " + eRel.toString());
+      }
+    }
+  }
 }
 
 /**
  * Xóa toàn bộ kho báo cáo (Giữ lại dòng tiêu đề cột)
  */
-function clearAllReportsFromSheet() {
-  var ss = getDatabaseSpreadsheet();
-  if (!ss) return { success: false, error: "Không thể mở cơ sở dữ liệu Spreadsheet" };
-  var sheet = ss.getSheetByName(CONFIG.SHEET_REPORTS);
-  if (!sheet) return { success: false, error: "Không tìm thấy Sheet Sổ Lưu Báo Cáo" };
+function clearAllReportsFromSheet(authPayload) {
+  // Bắt buộc xác thực quyền Quản trị viên Admin
+  var keyToVerifyClear = (typeof authPayload === "string")
+    ? authPayload
+    : (authPayload && (authPayload.adminKey || authPayload.apiKey || authPayload.key)) || "";
 
-  var lastRow = sheet.getLastRow();
-  if (lastRow > 1) {
-    sheet.deleteRows(2, lastRow - 1);
+  if (!verifyAdminApiKey(keyToVerifyClear)) {
+    return { success: false, error: "UNAUTHORIZED_ADMIN_ACTION" };
   }
 
-  return { success: true, message: "Đã xóa sạch toàn bộ kho dữ liệu báo cáo chuyên môn!" };
+  var lock = (typeof LockService !== "undefined" && typeof LockService.getScriptLock === "function")
+    ? LockService.getScriptLock()
+    : null;
+  var hasLock = false;
+  if (lock) {
+    try {
+      hasLock = lock.tryLock(15000);
+    } catch (eLock) {
+      Logger.log("Lỗi acquire script lock clear: " + eLock.toString());
+    }
+    if (!hasLock) {
+      return { success: false, error: "Hệ thống đang bận xử lý dữ liệu đồng thời, vui lòng thử lại sau" };
+    }
+  }
+
+  try {
+    var ss = getDatabaseSpreadsheet();
+    if (!ss) return { success: false, error: "Không thể mở cơ sở dữ liệu Spreadsheet" };
+    var sheet = ss.getSheetByName(CONFIG.SHEET_REPORTS);
+    if (!sheet) return { success: false, error: "Không tìm thấy Sheet Sổ Lưu Báo Cáo" };
+
+    var lastRow = sheet.getLastRow();
+    if (lastRow > 1) {
+      sheet.deleteRows(2, lastRow - 1);
+    }
+
+    return { success: true, message: "Đã xóa sạch toàn bộ kho dữ liệu báo cáo chuyên môn!" };
+  } catch (err) {
+    Logger.log("Lỗi clearAllReportsFromSheet: " + (err ? err.toString() : ""));
+    return { success: false, error: "Không thể xóa sạch kho dữ liệu báo cáo" };
+  } finally {
+    if (lock && hasLock) {
+      try {
+        lock.releaseLock();
+      } catch (eRel) {
+        Logger.log("Lỗi release lock clear: " + eRel.toString());
+      }
+    }
+  }
 }
 
 // ====================================================================================================
@@ -2577,21 +3681,21 @@ function fetchSchoolTimetableData() {
         }
       }
     }
-  } catch (ce) {}
-
-  // 2. Kiểm tra tính hợp lệ của cấu hình URL Firebase
-  if (!CONFIG.FIREBASE_DATABASE_URL || typeof CONFIG.FIREBASE_DATABASE_URL !== "string" || !CONFIG.FIREBASE_DATABASE_URL.trim()) {
+  } catch (ce) {
+    if (typeof Logger !== "undefined") Logger.log("⚠️ Không thể đọc cache thời khóa biểu: " + ce);
+  }
+  // 2. Kiểm tra tính hợp lệ của cấu hình URL Firebase (chỉ chấp nhận HTTPS và miền Firebase hợp chuẩn)
+  var fbUrl = (typeof CONFIG !== "undefined" && CONFIG && typeof CONFIG.FIREBASE_DATABASE_URL === "string") ? CONFIG.FIREBASE_DATABASE_URL.trim() : "";
+  if (!fbUrl || !/^https:\/\/([a-z0-9-]+\.)*(firebaseio\.com|firebasedatabase\.app)(\/.*)?$/i.test(fbUrl)) {
     if (typeof Logger !== "undefined") {
-      Logger.log("⚠️ CONFIG.FIREBASE_DATABASE_URL chưa được cấu hình. Vui lòng cấu hình URL Firebase Realtime Database.");
+      Logger.log("⚠️ CONFIG.FIREBASE_DATABASE_URL không hợp lệ hoặc không thuộc miền HTTPS Firebase hợp chuẩn.");
     }
     return null;
   }
 
   // 3. Kiểm tra môi trường thực thi (UrlFetchApp khả dụng trên Apps Script)
   if (typeof UrlFetchApp === "undefined" || !UrlFetchApp.fetch) {
-    if (typeof Logger !== "undefined") {
-      Logger.log("⚠️ UrlFetchApp không khả dụng trong môi trường hiện tại.");
-    }
+    if (typeof Logger !== "undefined") Logger.log("⚠️ UrlFetchApp không khả dụng trong môi trường hiện tại.");
     return null;
   }
 
@@ -2636,13 +3740,13 @@ function fetchSchoolTimetableData() {
 
     // Lưu cache ngắn 60 giây nếu dữ liệu hợp lệ
     try {
-      if (typeof CacheService !== "undefined") {
-        var cacheToSave = CacheService.getScriptCache();
-        if (cacheToSave && text.length < 100000) {
-          cacheToSave.put("CACHED_TKB_DATA", text, 60);
-        }
+      var cacheToSave = typeof CacheService !== "undefined" ? CacheService.getScriptCache() : null;
+      if (cacheToSave && text.length < 100000) cacheToSave.put("CACHED_TKB_DATA", text, 60);
+    } catch (pe) {
+      if (typeof Logger !== "undefined") {
+        Logger.log("⚠️ Không thể lưu cache TKB: " + pe.toString());
       }
-    } catch (pe) {}
+    }
 
     return data;
   } catch (e) {
@@ -2659,7 +3763,7 @@ function getActiveTimetable(schoolData) {
   var weekName = "Đợt hiện hành";
   var applyDate = schoolData.timetableApplyDate || "";
 
-  if (schoolData.currentWeekId && schoolData.weeklyTimetables) {
+  if (schoolData.currentWeekId && Array.isArray(schoolData.weeklyTimetables)) {
     var wt = schoolData.weeklyTimetables.find(function(w) { return w && w.id === schoolData.currentWeekId; });
     if (wt && wt.timetable) {
       timetable = wt.timetable;
@@ -2672,7 +3776,7 @@ function getActiveTimetable(schoolData) {
 
 function parseDayFilter(keyword) {
   if (!keyword) return null;
-  var clean = removeVietnameseTones(keyword);
+  var clean = removeVietnameseTones(String(keyword));
   var dayOfWeek = (new Date()).getDay();
   if (/(?:^|[^a-z0-9])(hom nay|hn|today)(?:[^a-z0-9]|$)/i.test(clean)) {
     var map = { 1: "T2", 2: "T3", 3: "T4", 4: "T5", 5: "T6", 6: "T7" };
@@ -2693,8 +3797,8 @@ function parseDayFilter(keyword) {
 }
 
 function canonicalizeVietnameseTone(str) {
-  if (!str) return "";
-  var s = str.normalize("NFC").toLowerCase();
+  if (str == null) return "";
+  var s = String(str).normalize("NFC").toLowerCase();
   s = s.replace(/úy/g, "uý").replace(/ùy/g, "uỳ").replace(/ủy/g, "uỷ").replace(/ũy/g, "uỹ").replace(/ụy/g, "uỵ");
   s = s.replace(/óa/g, "oá").replace(/òa/g, "oà").replace(/ỏa/g, "oả").replace(/õa/g, "oã").replace(/ọa/g, "oạ");
   s = s.replace(/óe/g, "oé").replace(/òe/g, "oè").replace(/ỏe/g, "oẻ").replace(/õe/g, "oẽ").replace(/ọe/g, "oẹ");
@@ -2702,13 +3806,13 @@ function canonicalizeVietnameseTone(str) {
 }
 
 function normToken(str) {
-  return removeVietnameseTones(str).replace(/[^a-z0-9]/g, "");
+  if (str == null) return "";
+  return removeVietnameseTones(String(str)).replace(/[^a-z0-9]/g, "");
 }
 
 function findMatchingClass(query, classes) {
-  if (!query || !classes || classes.length === 0) return null;
-  var raw = query.trim();
-  var clean = removeVietnameseTones(raw);
+  if (!query || !Array.isArray(classes) || classes.length === 0) return null;
+  var clean = removeVietnameseTones(String(query).trim());
 
   var cleanTarget = clean;
   var prefixes = ["thoi khoa bieu", "lich day", "lich hoc", "xem tkb", "in tkb", "tkb", "lop"];
@@ -2745,7 +3849,7 @@ function findMatchingClass(query, classes) {
   var queryTokens = clean.split(/[^a-z0-9]+/).filter(Boolean);
   for (var i = 0; i < sortedClasses.length; i++) {
     var c = sortedClasses[i];
-    if (c && queryTokens.indexOf(removeVietnameseTones(c.name)) !== -1) {
+    if (c && c.name && queryTokens.indexOf(removeVietnameseTones(String(c.name))) !== -1) {
       return c;
     }
   }
@@ -2753,7 +3857,7 @@ function findMatchingClass(query, classes) {
   for (var i = 0; i < sortedClasses.length; i++) {
     var c = sortedClasses[i];
     if (c && c.name) {
-      var cClean = removeVietnameseTones(c.name);
+      var cClean = removeVietnameseTones(String(c.name)).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       var regex = new RegExp("(?:^|[^a-z0-9])" + cClean + "(?:[^a-z0-9]|$)", "i");
       if (regex.test(clean)) {
         return c;
@@ -2765,8 +3869,8 @@ function findMatchingClass(query, classes) {
 }
 
 function findMatchingTeacher(rawQuery, teachers) {
-  if (!rawQuery || !teachers || teachers.length === 0) return null;
-  var text = rawQuery.trim();
+  if (!rawQuery || !Array.isArray(teachers) || teachers.length === 0) return null;
+  var text = String(rawQuery).trim();
   var clean = removeVietnameseTones(text);
 
   var cleanTarget = clean;
@@ -2830,24 +3934,24 @@ function findMatchingTeacher(rawQuery, teachers) {
   }
 
   // 4. Khớp shortName với ranh giới từ
-  var sortedByShort = teachers.slice().sort(function(a, b) { return (b.shortName || "").length - (a.shortName || "").length; });
+  var sortedByShort = teachers.slice().sort(function(a, b) { return ((b && b.shortName) || "").length - ((a && a.shortName) || "").length; });
   for (var i = 0; i < sortedByShort.length; i++) {
     var t = sortedByShort[i];
     if (!t || !t.shortName) continue;
-    var sClean = removeVietnameseTones(t.shortName);
-    var sPattern = sClean.replace(/\./g, "[._\\s]?");
+    var sClean = removeVietnameseTones(String(t.shortName)).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    var sPattern = sClean.replace(/\\\./g, "[._\\s]?");
     var regex = new RegExp("(?:^|[^a-z0-9])" + sPattern + "(?:[^a-z0-9]|$)", "i");
     if (regex.test(clean)) return t;
   }
 
   // 5. Khớp fullName với ranh giới từ
-  var sortedByFull = teachers.slice().sort(function(a, b) { return (b.fullName || "").length - (a.fullName || "").length; });
+  var sortedByFull = teachers.slice().sort(function(a, b) { return ((b && b.fullName) || "").length - ((a && a.fullName) || "").length; });
   for (var i = 0; i < sortedByFull.length; i++) {
     var t = sortedByFull[i];
     if (!t || !t.fullName) continue;
-    var fClean = removeVietnameseTones(t.fullName);
+    var fClean = removeVietnameseTones(String(t.fullName));
     if (fClean.length >= 4) {
-      var regex = new RegExp("(?:^|[^a-z0-9])" + fClean.replace(/\s+/g, "\\s+") + "(?:[^a-z0-9]|$)", "i");
+      var regex = new RegExp("(?:^|[^a-z0-9])" + fClean.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+") + "(?:[^a-z0-9]|$)", "i");
       if (regex.test(clean)) return t;
     }
   }
@@ -2857,9 +3961,9 @@ function findMatchingTeacher(rawQuery, teachers) {
 
 function getHomeroomTeacher(classObj, timetable, assignments, teachers) {
   if (!classObj) return null;
-  if (classObj.gvcn && classObj.gvcn.trim()) {
+  if (typeof classObj.gvcn === "string" && classObj.gvcn.trim()) {
     var rawGv = classObj.gvcn.trim();
-    var t = teachers ? teachers.find(function(x) { return x && (x.shortName === rawGv || x.fullName === rawGv); }) : null;
+    var t = Array.isArray(teachers) ? teachers.find(function(x) { return x && (x.shortName === rawGv || x.fullName === rawGv); }) : null;
     return t ? (t.fullName + " (" + t.shortName + ")") : rawGv;
   }
 
@@ -2872,7 +3976,7 @@ function getHomeroomTeacher(classObj, timetable, assignments, teachers) {
     var daySlots = clsSchedule[days[d]] || {};
     for (var p = 1; p <= 5; p++) {
       var slot = daySlots[p];
-      if (slot && slot.teacher && slot.subject) {
+      if (slot && typeof slot.subject === "string" && typeof slot.teacher === "string" && slot.subject.trim()) {
         var sub = slot.subject.toLowerCase();
         if (sub.includes("shl") || sub.includes("sinh hoat") || sub.includes("hdtn")) {
           gvShort = slot.teacher;
@@ -2884,13 +3988,19 @@ function getHomeroomTeacher(classObj, timetable, assignments, teachers) {
   }
 
   if (!gvShort) return null;
-  var tObj = teachers ? teachers.find(function(x) { return x && x.shortName === gvShort; }) : null;
+  var tObj = Array.isArray(teachers) ? teachers.find(function(x) { return x && x.shortName === gvShort; }) : null;
   return tObj ? (tObj.fullName + " (" + tObj.shortName + ")") : gvShort;
 }
 
 function sendZaloBotReply(chatId, text) {
-  if (!CONFIG.ZALO_BOT_TOKEN || !chatId) return { success: false, reason: "MISSING_PARAMS" };
-  var apiUrl = "https://bot-api.zaloplatforms.com/bot" + CONFIG.ZALO_BOT_TOKEN + "/sendMessage";
+  var botToken =
+    typeof CONFIG !== "undefined" &&
+    CONFIG &&
+    typeof CONFIG.ZALO_BOT_TOKEN === "string"
+      ? CONFIG.ZALO_BOT_TOKEN.trim()
+      : "";
+  if (!botToken || !chatId) return { success: false, reason: "MISSING_PARAMS" };
+  var apiUrl = "https://bot-api.zaloplatforms.com/bot" + botToken + "/sendMessage";
   var payload = {
     chat_id: String(chatId),
     text: text
@@ -2925,10 +4035,11 @@ function getChatIdByPhone(phoneNumber) {
   var sheet = ss.getSheetByName(CONFIG.SHEET_USERS);
   if (!sheet) return null;
 
-  var data = sheet.getDataRange().getValues();
   var targetNorm = normalizePhone(phoneNumber);
-
+  if (!targetNorm) return null;
+  var data = sheet.getDataRange().getValues();
   for (var i = 1; i < data.length; i++) {
+    if (!data[i] || data[i][2] == null) continue;
     var rowPhone = normalizePhone(String(data[i][2]));
     if (rowPhone === targetNorm) {
       var chatId = String(data[i][5] || "").trim();
@@ -2942,15 +4053,14 @@ function normalizePhone(p) {
   if (!p) return "";
   var clean = String(p).replace(/[^0-9]/g, "");
   if (clean.startsWith("840") && clean.length >= 11) {
-    clean = clean.slice(2); // "+840818810007" -> "0818810007"
+    clean = clean.slice(2);
   } else if (clean.startsWith("84") && clean.length >= 10) {
-    clean = "0" + clean.slice(2); // "84818810007" -> "0818810007"
+    clean = "0" + clean.slice(2);
   }
   if (clean.length === 9 && !clean.startsWith("0")) {
-    clean = "0" + clean; // "818810007" -> "0818810007"
-  }
-  if (clean.length === 10 && !clean.startsWith("0") && clean.startsWith("2")) {
-    clean = "0" + clean; // "2553850001" -> "02553850001" (Đầu số bàn Quảng Ngãi)
+    clean = "0" + clean; // Di động rụng số 0: 9 chữ số -> 10 chữ số chuẩn
+  } else if (clean.length === 10 && clean.startsWith("2")) {
+    clean = "0" + clean; // Cố định QCVN 11 chữ số (đầu 2) rụng số 0 -> 11 chữ số chuẩn
   }
   return clean;
 }
@@ -2975,9 +4085,9 @@ function removeVietnameseTones(str) {
 }
 
 function getOrCreateFolderHierarchy(pathStr) {
-  var parts = pathStr.split("/").map(function(s) { return s.trim(); }).filter(Boolean);
   var currentFolder = DriveApp.getRootFolder();
-
+  if (typeof pathStr !== "string" || !pathStr.trim()) return currentFolder;
+  var parts = pathStr.split("/").map(function(s) { return s.trim(); }).filter(Boolean);
   for (var i = 0; i < parts.length; i++) {
     var name = parts[i];
     var folders = currentFolder.getFoldersByName(name);

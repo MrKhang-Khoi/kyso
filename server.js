@@ -88,46 +88,49 @@ if (!fs.existsSync(LOCK_DIR)) {
  * Triệt tiêu hoàn toàn rủi ro gửi PDF rỗng hoặc PDF văn bản thông thường rồi đòi cấp hasSchoolSeal = true.
  */
 function verifySchoolSealArtifact(rawBuffer) {
-  if (!rawBuffer || !Buffer.isBuffer(rawBuffer) || rawBuffer.length < 100) return false;
+  if (!rawBuffer || !Buffer.isBuffer(rawBuffer) || rawBuffer.length < 100 || rawBuffer.length > 35 * 1024 * 1024) return false;
   
   const head = rawBuffer.subarray(0, 10).toString('ascii');
   if (!head.startsWith('%PDF-')) return false;
 
-  const tail = rawBuffer.subarray(Math.max(0, rawBuffer.length - 1024)).toString('latin1');
+  const tail = rawBuffer.subarray(Math.max(0, rawBuffer.length - 65536)).toString('latin1');
   if (!tail.includes('%%EOF')) return false;
 
   const pdfString = rawBuffer.toString('latin1');
-
-  // 1. Kiểm tra Signature Dictionary: /Type /Sig bắt buộc
-  const hasSigType = /\/Type\s*\/Sig\b/.test(pdfString);
-  if (!hasSigType) return false;
-
-  // 2. Kiểm tra ByteRange hợp lệ: phải có [ offset1 len1 offset2 len2 ]
-  const byteRangeMatch = pdfString.match(/\/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]/);
+  // 1. Tokenizer PDF giới hạn: bỏ qua literal/hex string, comment % và nhảy qua stream theo /Length
+  const sigPositions = []; let inStr = false, inHex = false, inCom = false, sDepth = 0, dDepth = 0, dStart = -1, inObj = false, lastDict = '';
+  for (let i = 0; i < pdfString.length; i++) {
+    const c = pdfString.charCodeAt(i);
+    if (inCom) { if (c === 10 || c === 13) inCom = false; continue; }
+    if (inStr) { if (c === 92) { i++; continue; } if (c === 40) sDepth++; else if (c === 41 && --sDepth === 0) inStr = false; continue; }
+    if (inHex) { if (c === 62) inHex = false; continue; }
+    if (c === 37) { inCom = true; continue; }
+    if (c === 40) { inStr = true; sDepth = 1; continue; }
+    if (c === 60) { if (pdfString.charCodeAt(i + 1) === 60) { if (dDepth === 0) dStart = i; dDepth++; i++; } else inHex = true; continue; }
+    if (c === 62 && pdfString.charCodeAt(i + 1) === 62) {
+      if (dDepth > 0 && --dDepth === 0 && dStart !== -1) {
+        lastDict = pdfString.slice(dStart, i + 2);
+        if (inObj && !/\([^)]*\/Type\s*\/Sig[^)]*\)/.test(lastDict) && /\/Type\s*\/Sig\b/.test(lastDict)) sigPositions.push(lastDict);
+        dStart = -1;
+      }
+      i++; continue;
+    }
+    if (c === 115 && pdfString.startsWith('stream', i) && (i === 0 || pdfString.charCodeAt(i - 1) <= 32 || pdfString.charCodeAt(i - 1) === 62)) {
+      let es = -1, lm = lastDict.match(/\/Length\s+(\d+)\b/); if (lm) { let p = i + 6; if (pdfString.charCodeAt(p) === 13) p++; if (pdfString.charCodeAt(p) === 10) p++; let cp = p + parseInt(lm[1], 10); while (cp < pdfString.length && pdfString.charCodeAt(cp) <= 32) cp++; if (pdfString.startsWith('endstream', cp)) es = cp; } if (es === -1) { es = pdfString.indexOf('endstream', i + 6); if (es === -1 || pdfString.charCodeAt(es - 1) > 32) return false; const n = es + 9 < pdfString.length ? pdfString.charCodeAt(es + 9) : 10; if (n > 32 && n !== 101) return false; } i = es + 8; continue; }
+    if (c === 111 && pdfString.startsWith('obj', i) && (i === 0 || pdfString.charCodeAt(i - 1) <= 32)) inObj = true; if (c === 101 && pdfString.startsWith('endobj', i)) { inObj = false; dDepth = 0; dStart = -1; lastDict = ''; i += 5; } } if (inStr || inHex || sigPositions.length !== 1) return false; const sigDict = sigPositions[0];
+  // 2. Trích xuất và thẩm tra /ByteRange trực tiếp từ đối tượng chữ ký
+  const byteRangeMatch = sigDict.match(/\/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]/);
   if (!byteRangeMatch) return false;
+  const o1 = parseInt(byteRangeMatch[1], 10), l1 = parseInt(byteRangeMatch[2], 10);
+  const o2 = parseInt(byteRangeMatch[3], 10), l2 = parseInt(byteRangeMatch[4], 10);
+  if (o1 !== 0 || l1 <= 0 || o2 < (o1 + l1) || l2 < 0 || (o2 + l2) > rawBuffer.length) return false;
 
-  const o1 = parseInt(byteRangeMatch[1], 10);
-  const l1 = parseInt(byteRangeMatch[2], 10);
-  const o2 = parseInt(byteRangeMatch[3], 10);
-  const l2 = parseInt(byteRangeMatch[4], 10);
-
-  // o1 bắt buộc là 0, độ dài không âm, o2 phải lớn hơn l1, và tổng không vượt quá rawBuffer.length
-  if (o1 !== 0 || l1 <= 0 || o2 <= l1 || (o2 + l2) > rawBuffer.length) {
-    return false;
-  }
-
-  // 3. Kiểm tra Filter và SubFilter tiêu chuẩn chữ ký số công quyền (Adobe.PPKLite, ETSI.CAdES)
-  const hasFilter = /\/Filter\s*\/(Adobe\.PPKLite|ETSI\.CAdES|Adobe\.PPKMS)\b/.test(pdfString);
-  const hasSubFilter = /\/SubFilter\s*\/(adbe\.pkcs7\.detached|adbe\.pkcs7\.sha1|ETSI\.CAdES\.detached)\b/.test(pdfString);
+  // 3. Kiểm tra Filter và SubFilter trực tiếp trong đối tượng chữ ký
+  const hasFilter = /\/Filter\s*\/(Adobe\.PPKLite|ETSI\.CAdES|Adobe\.PPKMS)\b/.test(sigDict);
+  const hasSubFilter = /\/SubFilter\s*\/(adbe\.pkcs7\.detached|adbe\.pkcs7\.sha1|ETSI\.CAdES\.detached)\b/.test(sigDict);
   if (!hasFilter || !hasSubFilter) return false;
-
-  // 4. Kiểm tra Danh tính Pháp nhân Trường:
-  // Danh tính trường phải nằm trong Vùng Signature Dictionary (/Name, /Reason, /Location, /ContactInfo),
-  // hoặc trong khối /Contents <hex>, hoặc trong XObject Image (/school_seal, /dau_truong).
-  // TUYỆT ĐỐI CẤM chấp nhận text keyword nằm trôi nổi trong content stream thông thường của trang sách!
-  const sigIndex = pdfString.indexOf('/Type /Sig') !== -1 ? pdfString.indexOf('/Type /Sig') : pdfString.indexOf('/Type/Sig');
-  const sigObjectContext = pdfString.slice(Math.max(0, sigIndex - 100), Math.min(pdfString.length, sigIndex + 1500));
-
+  // 4. Kiểm tra Danh tính Pháp nhân Trường trong Signature Dictionary Context
+  const sigObjectContext = sigDict;
   const legalKeywords = [
     'TRUONG THCS CHU VAN AN',
     'TRƯỜNG THCS CHU VĂN AN',
@@ -148,22 +151,19 @@ function verifySchoolSealArtifact(rawBuffer) {
   const hasSealXObject = (pdfString.includes('/school_seal') || pdfString.includes('/dau_truong')) && pdfString.includes('/Subtype /Image');
 
   let hasLegalIdInContents = false;
-  const contentsMatch = pdfString.match(/\/Contents\s*<([0-9a-fA-F\s]+)>/);
+  const contentsMatch = sigDict.match(/\/Contents\s*<([0-9a-fA-F\s]+)>/);
   if (contentsMatch) {
     const hexContents = contentsMatch[1].replace(/\s+/g, '');
     try {
       const derString = Buffer.from(hexContents, 'hex').toString('latin1');
       hasLegalIdInContents = legalKeywords.some(kw => derString.includes(kw));
-    } catch {}
+    } catch (derErr) { void derErr; }
   }
-
   if (hasLegalIdInSigContext || hasLegalIdInContents || hasSealXObject) {
     return true;
   }
-
   return false;
 }
-
 /**
  * Ghi nhật ký giao dịch Transaction Journal nguyên tử (Atomic Journal Write với fsync).
  * Ngăn chặn hoàn toàn tình trạng journal bị cắt ngắn hoặc rỗng khi process bị kill giữa chừng.
@@ -205,37 +205,37 @@ function writeJournalFileAtomic(journalPath, data) {
 
   return journalPath;
 }
-
+function getSafeJournalPath(docId) {
+  if (!docId || typeof docId !== 'string') return null;
+  const cleanId = docId.trim();
+  if (!/^[a-zA-Z0-9_\-]+$/.test(cleanId)) return null;
+  const jPath = path.resolve(TX_DIR, cleanId + '.tx.json');
+  const rel = path.relative(TX_DIR, jPath);
+  return (rel.startsWith('..') || path.isAbsolute(rel)) ? null : jPath;
+}
 function writeTransactionJournal(safeDocId, data) {
-  const journalPath = path.join(TX_DIR, `${safeDocId}.tx.json`);
+  const journalPath = getSafeJournalPath(safeDocId);
+  if (!journalPath) throw new Error('[Transaction Journal] ID hồ sơ không hợp lệ: ' + safeDocId);
   return writeJournalFileAtomic(journalPath, data);
 }
-
 function removeTransactionJournal(safeDocId) {
-  const journalPath = path.join(TX_DIR, `${safeDocId}.tx.json`);
-  try {
-    if (fs.existsSync(journalPath)) {
-      fs.unlinkSync(journalPath);
-    }
-    return true;
-  } catch (err) {
-    console.warn('[Transaction Journal] Không thể xóa journal:', err.message);
-    return false;
-  }
+  const journalPath = getSafeJournalPath(safeDocId);
+  if (!journalPath) return false;
+  try { if (fs.existsSync(journalPath)) fs.unlinkSync(journalPath); return true; }
+  catch (err) { console.warn('[Transaction Journal] Không thể xóa journal:', err.message); return false; }
 }
-
 const UPLOAD_ROOT = path.resolve(__dirname, 'uploads', 'documents');
-
-/**
- * Kiểm tra xem một đường dẫn có nằm an toàn tuyệt đối trong UPLOAD_ROOT hay không.
- * Triệt tiêu hoàn toàn Path Traversal (../) và truy cập ngoài phạm vi thư mục uploads.
- */
 function isWithinUploadRoot(targetPath) {
   if (!targetPath || typeof targetPath !== 'string') return false;
   try {
-    const resolved = path.resolve(targetPath);
-    const rel = path.relative(UPLOAD_ROOT, resolved);
-    return !rel.startsWith('..') && !path.isAbsolute(rel);
+    const root = fs.existsSync(UPLOAD_ROOT) ? fs.realpathSync(UPLOAD_ROOT) : path.resolve(UPLOAD_ROOT);
+    let resolved = path.resolve(targetPath);
+    if (fs.existsSync(resolved)) { resolved = fs.realpathSync(resolved); } else {
+      let cur = path.dirname(resolved);
+      while (cur && !fs.existsSync(cur) && cur !== path.dirname(cur)) cur = path.dirname(cur);
+      if (fs.existsSync(cur) && (path.relative(root, fs.realpathSync(cur)).startsWith('..') || path.isAbsolute(path.relative(root, fs.realpathSync(cur))))) return false;
+    }
+    const rel = path.relative(root, resolved); return !rel.startsWith('..') && !path.isAbsolute(rel);
   } catch (e) {
     return false;
   }
@@ -291,7 +291,7 @@ function resolveLocalDocumentPath(doc) {
 // Quét và tự động dọn dẹp các tệp tạm/orphan file khi khởi động máy chủ (Crash Recovery Reconciliation)
 function reconcileOrphanDocumentsOnStartup() {
   try {
-    const uploadDir = path.join(__dirname, 'uploads', 'documents');
+    const uploadDir = path.resolve(UPLOAD_ROOT);
     const stagingDir = path.join(uploadDir, 'staging');
     if (!fs.existsSync(uploadDir)) return;
     if (!fs.existsSync(stagingDir)) fs.mkdirSync(stagingDir, { recursive: true });
@@ -459,7 +459,7 @@ function reconcileOrphanDocumentsOnStartup() {
                     docInDb.driveFileId ||
                     docInDb.driveInfo ||
                     docInDb.storage === 'google_drive' ||
-                    (docInDb.filePath && !docInDb.filePath.startsWith('uploads/documents/'))
+                    (typeof docInDb.filePath === 'string' && !docInDb.filePath.startsWith('uploads/documents/'))
                   );
                   if (hasCloudStorage) {
                     console.warn(`[Crash Recovery Cloud Alert] Hồ sơ [${jData.docId}] có nguồn lưu trữ đám mây nhưng mất tệp vật lý. Bảo tồn DB và giữ journal ở CLOUD_RECOVERY_REQUIRED.`);
@@ -568,7 +568,7 @@ function reconcileOrphanDocumentsOnStartup() {
                 }
               }
               if (jData.savedFilePath && fs.existsSync(jData.savedFilePath)) {
-                const allActiveDocs = (typeof dataStore.getDocuments === 'function' ? dataStore.getDocuments() : []);
+                const rawDocs = (typeof dataStore.getDocuments === 'function' ? dataStore.getDocuments() : null); const allActiveDocs = Array.isArray(rawDocs) ? rawDocs : [];
                 const isReferencedByActiveDoc = allActiveDocs.some(d => {
                   if (!d || !d.id) return false;
                   if (d.id === jData.docId) return false;
@@ -625,11 +625,11 @@ function reconcileOrphanDocumentsOnStartup() {
               // Kiểm tra xem DB đã kịp commit bước ký mới này trước khi crash hay chưa
               const isDbCommitted = Boolean(
                 docInDb &&
-                docInDb.filePath &&
-                jData.newFilePath &&
+                typeof docInDb.filePath === 'string' &&
+                typeof jData.newFilePath === 'string' &&
                 (
-                  path.resolve(__dirname, docInDb.filePath) === path.resolve(jData.newFilePath) ||
-                  jData.newFilePath.endsWith(path.basename(docInDb.filePath))
+                  path.resolve(__dirname, docInDb.filePath) ===
+                  path.resolve(__dirname, jData.newFilePath)
                 )
               );
 
@@ -737,7 +737,8 @@ function reconcileOrphanDocumentsOnStartup() {
     }
 
     // 2. Đối soát hai chiều DB <-> Filesystem (Two-Way Reconciliation)
-    const docs = typeof dataStore.getDocuments === 'function' ? dataStore.getDocuments() : [];
+    const rawDocs = typeof dataStore.getDocuments === 'function' ? dataStore.getDocuments() : [];
+    const docs = Array.isArray(rawDocs) ? rawDocs : [];
     for (const doc of docs) {
       if (!doc || !doc.id) continue;
       const safeId = String(doc.id).replace(/[^a-zA-Z0-9_\-]/g, '_');
@@ -754,8 +755,7 @@ function reconcileOrphanDocumentsOnStartup() {
         (typeof doc.filePath === 'string' && (
           doc.filePath.startsWith('http://') ||
           doc.filePath.startsWith('https://') ||
-          doc.filePath.startsWith('drive://') ||
-          (!doc.filePath.includes('uploads/') && !doc.filePath.includes('data/documents/'))
+          doc.filePath.startsWith('drive://')
         ))
       );
 
@@ -868,7 +868,9 @@ function reconcileOrphanDocumentsOnStartup() {
     if (fs.existsSync(stagingDir)) {
       const stagedFiles = fs.readdirSync(stagingDir);
       for (const sf of stagedFiles) {
-        if (!sf.endsWith('.stage')) continue;
+        const stageMatch = sf.match(/^doc_([A-Za-z0-9_\-]+)\.pdf\.stage$/);
+        if (!stageMatch) continue;
+        const safeId = stageMatch[1];
         const fullStagePath = path.join(stagingDir, sf);
         try {
           const stat = fs.statSync(fullStagePath);
@@ -876,28 +878,26 @@ function reconcileOrphanDocumentsOnStartup() {
           if (Date.now() - stat.mtimeMs <= 15 * 60 * 1000) {
             continue;
           }
-          // Trích xuất mã an toàn docId từ tên file: doc_<safeId>.pdf.stage
-          const stageMatch = sf.match(/^doc_(.+)\.pdf\.stage$/);
-          const safeId = stageMatch ? stageMatch[1] : null;
-          if (safeId) {
-            // 1. Kiểm tra Transaction Journal: Bỏ qua nếu journal còn tồn tại ở bất kỳ trạng thái nào!
+          const cleanupLock = acquireDocumentLock(safeId, 'reconciliation_cleanup');
+          if (!cleanupLock) continue;
+          try {
             const journalCandidate = path.join(TX_DIR, `${safeId}.tx.json`);
-            if (fs.existsSync(journalCandidate)) {
+            if (fs.existsSync(journalCandidate)) continue;
+            let docInDb = null;
+            try {
+              docInDb = typeof dataStore.getDocumentById === 'function' ? dataStore.getDocumentById(safeId) : null;
+            } catch (dbErr) {
+              console.warn('[Reconciliation] DB fail-closed:', dbErr.message);
               continue;
             }
-            // 2. Kiểm tra Lock còn hiệu lực: Bỏ qua nếu lock file còn tồn tại
-            const lockCandidate = path.join(LOCK_DIR, `${safeId}.lock`);
-            if (fs.existsSync(lockCandidate)) {
-              continue;
-            }
-            // 3. Kiểm tra Database: Bỏ qua nếu bản ghi đã tồn tại trong DB
-            const docInDb = (typeof dataStore.getDocumentById === 'function' ? dataStore.getDocumentById(safeId) : null);
-            if (docInDb) {
-              continue;
-            }
+            if (docInDb) continue;
+            const trashStagePath = path.join(stagingDir, `${sf}.${crypto.randomBytes(4).toString('hex')}.trash`);
+            fs.renameSync(fullStagePath, trashStagePath);
+            try { fs.unlinkSync(trashStagePath); } catch (uErr) { console.warn('[Reconciliation] Trash:', uErr.message); }
+            cleaned++;
+          } finally {
+            releaseDocumentLock(safeId, cleanupLock);
           }
-          fs.unlinkSync(fullStagePath);
-          cleaned++;
         } catch (stageErr) {
           console.warn('[Reconciliation] Không thể dọn staging file cũ:', stageErr.message);
         }
@@ -925,7 +925,7 @@ function isCanonicalBgh(u) {
 
   return role === 'BGH' ||
     role === 'ADMIN' ||
-    Boolean(u.canStampSeal) ||
+    u.canStampSeal === true ||
     deptId === 'dept_bgh' ||
     department.includes('giám hiệu') ||
     roleTitle.includes('hiệu trưởng') ||
@@ -949,7 +949,7 @@ function isCanonicalHead(u) {
 
 
 function isPidAlive(pid) {
-  if (!pid || typeof pid !== 'number') return false;
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -1029,49 +1029,49 @@ function acquireDocumentLock(docId, creatorId) {
 
 function releaseDocumentLock(docId, lockToken) {
   if (!docId) return false;
-  const expectedToken = lockToken || documentCreationLocks.get(docId);
-  if (!expectedToken) return false;
-
+  const ramToken = documentCreationLocks.get(docId);
+  if (lockToken && ramToken && ramToken !== lockToken) return false;
+  const expectedToken = lockToken || ramToken;
+  if (typeof expectedToken !== 'string' || !expectedToken.trim()) return false;
   const safeId = String(docId).replace(/[^a-zA-Z0-9_\-]/g, '_');
   const lockFilePath = path.join(LOCK_DIR, `${safeId}.lock`);
   try {
     if (!fs.existsSync(lockFilePath)) {
+      if (lockToken && ramToken && ramToken !== lockToken) return false;
       documentCreationLocks.delete(docId);
       return true;
     }
+    let statBefore = null;
     let existing = null;
     try {
+      statBefore = fs.statSync(lockFilePath);
       existing = JSON.parse(fs.readFileSync(lockFilePath, 'utf8'));
-    } catch (parseErr) {
-      console.warn('[Lock Release Parse]', parseErr.message);
-    }
+    } catch (parseErr) { console.warn('[Lock Release Parse]', parseErr.message); }
 
-    // CHỐT CHẶN BẢO VỆ CHỦ SỞ HỮU (OWNER-GUARDED RELEASE):
-    // Chỉ đúng worker có token trùng khớp mới được phép di dời & xóa lock file và xóa state RAM!
-    if (existing && existing.token === expectedToken) {
-      const releasingPath = path.join(LOCK_DIR, `${safeId}.${expectedToken}.releasing`);
-      try {
-        fs.renameSync(lockFilePath, releasingPath);
-        try {
-          fs.unlinkSync(releasingPath);
-        } catch (unlinkErr) {
-          console.warn('[Lock Release Unlink]', unlinkErr.message);
-        }
-        documentCreationLocks.delete(docId);
-        return true;
-      } catch (renameErr) {
-        console.warn('[Lock Release Rename]', renameErr.message);
-        return false;
-      }
-    } else {
-      // Token sai: TUYỆT ĐỐI KHÔNG XÓA state RAM của chủ sở hữu hợp pháp!
+    if (!existing || existing.token !== expectedToken) {
       console.warn(`[Lock Release Denied] Token không hợp lệ cho docId [${docId}]. Quyền sở hữu RAM được bảo toàn.`);
       return false;
     }
-  } catch (cleanErr) {
-    console.warn('[Lock Release]', cleanErr.message);
-    return false;
-  }
+
+    const releasingPath = path.join(LOCK_DIR, `${safeId}.${crypto.randomBytes(4).toString('hex')}.releasing`);
+    try {
+      fs.renameSync(lockFilePath, releasingPath);
+      let verified = false;
+      try {
+        const statAfter = fs.statSync(releasingPath);
+        const moved = JSON.parse(fs.readFileSync(releasingPath, 'utf8'));
+        const sameIno = !statBefore || !statBefore.ino || statAfter.ino === statBefore.ino;
+        verified = Boolean(moved && moved.token === expectedToken && sameIno);
+      } catch (vErr) { console.warn('[Lock Verify]', vErr.message); }
+      if (verified) {
+        try { fs.unlinkSync(releasingPath); } catch (uErr) { console.warn('[Lock Unlink]', uErr.message); }
+        documentCreationLocks.delete(docId); return true;
+      }
+      if (!fs.existsSync(lockFilePath)) {
+        try { fs.renameSync(releasingPath, lockFilePath); } catch (rErr) { console.warn('[Lock Restore]', rErr.message); }
+      } else { try { fs.unlinkSync(releasingPath); } catch (uErr) { console.warn('[Lock Stale]', uErr.message); } }
+      return false; } catch (renameErr) { console.warn('[Lock Release Rename]', renameErr.message); return false; }
+  } catch (cleanErr) { console.warn('[Lock Release]', cleanErr.message); return false; }
 }
 
 const app = express();
@@ -1266,30 +1266,28 @@ app.use((req, res, next) => {
 app.use('/uploads/signatures', requireAuth, (req, res, next) => {
   const requestedFile = path.basename(req.path);
   // Chỉ cho phép Ban Giám hiệu, Quản trị viên hoặc chính chủ nhân chữ ký tải file
-  if (
-    req.user.role === 'ADMIN' || 
-    req.user.role === 'BGH' || 
-    requestedFile === `sig_${req.user.id}.png` ||
-    requestedFile === `sig_${req.user.username}.png`
-  ) {
-    return express.static(path.join(__dirname, 'uploads', 'signatures'))(req, res, next);
+  const isOwner = requestedFile === `sig_${req.user.id}.png` || requestedFile === `sig_${req.user.username}.png`;
+  if (req.user.role === 'ADMIN' || req.user.role === 'BGH' || isOwner) {
+    return express.static(path.join(__dirname, 'uploads', 'signatures'), { fallthrough: false })(req, res, () => res.status(404).json({ success: false, message: 'Tệp chữ ký không tồn tại.' }));
   }
   return res.status(403).json({ success: false, message: 'Từ chối truy cập: Tài nguyên chữ ký và con dấu được bảo mật.' });
 });
 
-// Thư mục tài liệu PDF ký số yêu cầu xác thực phiên đăng nhập (Đặt TRƯỚC express.static('public') chống bypass)
-app.use('/uploads/documents', requireAuth, express.static(path.join(__dirname, 'uploads', 'documents')));
+// Thư mục tài liệu PDF ký số yêu cầu xác thực phiên đăng nhập (fallthrough: false chống bypass)
+app.use('/uploads/documents', requireAuth, (req, res) => {
+  express.static(path.join(__dirname, 'uploads', 'documents'), { fallthrough: false })(req, res, () => res.status(404).json({ success: false, message: 'Tài liệu không tồn tại.' }));
+});
 
 app.use(express.static(path.join(__dirname, 'public'), { etag: false, lastModified: false }));
 
-// Các tài nguyên tải lên thông thường khác
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// Tách biệt thư mục công khai, cấm static mount tổng quát /uploads để triệt tiêu bypass
+app.use('/uploads/public', express.static(path.join(__dirname, 'uploads', 'public'), { fallthrough: false }));
+app.use('/uploads', requireAuth, (_req, res) => res.status(404).json({ success: false, message: 'Tài nguyên không tồn tại.' }));
 
 // Phục vụ favicon.ico chuẩn xác
 app.get('/favicon.ico', (req, res) => {
   const ico = path.join(__dirname, 'public', 'favicon.ico');
-  if (fs.existsSync(ico)) return res.sendFile(ico);
-  return res.status(204).end();
+  return fs.existsSync(ico) ? res.sendFile(ico) : res.status(204).end();
 });
 
 // ==================== TẢI EDUSIGN AGENT 2.0 & 2.2 (CHUẨN WINDOWS - ZIP & EXE) ====================
@@ -1301,16 +1299,18 @@ app.get([
   '/docs/downloads/EduSign_Agent_v2.2_Setup.zip',
   '/docs/downloads/EduSign_Agent.zip'
 ], (req, res) => {
-  const reqName = req.path.includes('v2.2') ? 'EduSign_Agent_v2.2_Setup.zip' : 'EduSign_Agent_v2.0_Setup.zip';
-  const zipPath = path.join(__dirname, 'public', 'downloads', reqName);
-  const fallbackZipPath = path.join(__dirname, 'docs', 'downloads', reqName);
-  const targetFile = fs.existsSync(zipPath) ? zipPath : (fs.existsSync(fallbackZipPath) ? fallbackZipPath : null);
+  const zipMap = { 'EduSign_Agent_v2.0_Setup.zip': 'EduSign_Agent_v2.0_Setup.zip', 'EduSign_Agent_v2.2_Setup.zip': 'EduSign_Agent_v2.2_Setup.zip', 'EduSign_Agent.zip': 'EduSign_Agent_v2.2_Setup.zip' };
+  const base = path.basename(req.path);
+  const directPath = path.join(__dirname, 'public', 'downloads', base);
+  const fallbackPath = path.join(__dirname, 'docs', 'downloads', base);
+  const reqName = (fs.existsSync(directPath) || fs.existsSync(fallbackPath)) ? base : (zipMap[base] || 'EduSign_Agent_v2.2_Setup.zip');
+  const targetFile = [path.join(__dirname, 'public', 'downloads', reqName), path.join(__dirname, 'docs', 'downloads', reqName)].find(p => fs.existsSync(p)) || null;
   if (targetFile) {
     res.setHeader('Content-Type', 'application/zip');
     return res.download(targetFile, reqName);
   }
   // Nếu máy chủ đám mây chưa có sẵn tệp: Chuyển hướng siêu tốc 302 sang GitHub CDN chính thức
-  return res.redirect(302, `https://github.com/MrKhang-Khoi/kyso/raw/main/docs/downloads/${reqName}`);
+  return res.redirect(302, `https://github.com/MrKhang-Khoi/kyso/raw/main/docs/downloads/${encodeURIComponent(reqName)}`);
 });
 
 app.get(['/downloads/EduSign_Agent.exe', '/docs/downloads/EduSign_Agent.exe'], (req, res) => {
@@ -1348,50 +1348,51 @@ app.get(['/downloads/version.json', '/docs/downloads/version.json'], (req, res) 
 
 // ==================== 1. QUÉT CHỨNG THƯ SỐ VGCA ====================
 function scanLocalCertificates() {
+  if (process.platform !== 'win32') return { all: [], detectedVgca: null, scanStatus: 'UNSUPPORTED_PLATFORM' };
   try {
-    const psCommand = `powershell -NoProfile -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::InputEncoding = [System.Text.Encoding]::UTF8; $certs = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.Subject -match 'CN=' } | ForEach-Object { [PSCustomObject]@{ Subject = $_.Subject; Issuer = $_.Issuer; NotAfter = $_.NotAfter.ToString('yyyy-MM-dd HH:mm:ss'); HasPrivateKey = $_.HasPrivateKey; Thumbprint = $_.Thumbprint } }; $certs | ConvertTo-Json -Depth 3"`;
-    const output = execSync(psCommand, { encoding: 'utf8', timeout: 5000 });
+    const psCmd = `powershell -NoProfile -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $certs = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.Subject -match 'CN=' } | ForEach-Object { [PSCustomObject]@{ Subject = $_.Subject; Issuer = $_.Issuer; NotAfter = $_.NotAfter.ToString('yyyy-MM-dd HH:mm:ss'); HasPrivateKey = $_.HasPrivateKey; Thumbprint = $_.Thumbprint } }; $certs | ConvertTo-Json -Depth 3"`;
+    const output = execSync(psCmd, { encoding: 'utf8', timeout: 3000 });
     const parsed = JSON.parse(output);
-    const certList = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
-
-    const vgcaCert = certList.find(c => 
-      (c.Issuer && (c.Issuer.includes('Ban C') || c.Issuer.includes('VGCA') || c.Issuer.includes('Nhà nước') || c.Issuer.includes('Nha nuoc'))) ||
-      (c.Subject && (c.Subject.includes('gov.vn') || c.Subject.includes('CHU VAN AN') || c.Subject.includes('Chu Văn An')))
-    );
-
-    return {
-      all: certList,
-      detectedVgca: vgcaCert || null
-    };
+    const rawList = Array.isArray(parsed) ? parsed : (parsed && typeof parsed === 'object' ? [parsed] : []);
+    const certList = rawList.filter(c => c && typeof c === 'object' && typeof c.Thumbprint === 'string');
+    const norm = s => (typeof s === 'string' ? s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase() : '');
+    const VGCA_ISSUERS = ['BAN CO YEU', 'VGCA', 'NHA NUOC'];
+    const vgcaCert = certList.find(c => {
+      const iss = norm(c.Issuer);
+      const sub = norm(c.Subject);
+      return VGCA_ISSUERS.some(k => iss.includes(k)) || (sub.includes('GOV.VN') && iss.includes('CA'));
+    });
+    return { all: certList, detectedVgca: vgcaCert || null, scanStatus: vgcaCert ? 'READY' : 'NO_VGCA_FOUND' };
   } catch (err) {
-    return { all: [], detectedVgca: null };
+    console.warn('[VGCA Scan Warning]:', err && err.message ? err.message.slice(0, 100) : 'Quét thất bại');
+    return { all: [], detectedVgca: null, scanStatus: 'SCAN_ERROR' };
   }
 }
 
-let detectedInfo = (process.env.NODE_ENV === 'test') ? { all: [], detectedVgca: null } : scanLocalCertificates();
+let detectedInfo = (process.env.NODE_ENV === 'test') ? { all: [], detectedVgca: null, scanStatus: 'TEST_ENV' } : scanLocalCertificates();
+const activeVgca = detectedInfo && detectedInfo.detectedVgca;
 let realSigner = {
-  name: 'Hà Văn Tý',
-  email: 'hvty-dakha@quangngai.gov.vn',
-  school: 'TRƯỜNG TRUNG HỌC CƠ SỞ CHU VĂN AN',
-  department: 'Tổ Toán - Tin',
-  issuer: 'CA phục vụ các cơ quan Nhà nước G2 - Ban Cơ yếu Chính phủ',
-  thumbprint: '6398E3DC37E44EBBF976DFDE9F0143E1BDA5346D',
-  hasPrivateKey: true,
-  status: 'CONNECTED'
+  name: activeVgca && activeVgca.Subject ? (activeVgca.Subject.match(/CN=([^,]+)/) || [])[1] || '' : '',
+  email: activeVgca && activeVgca.Subject ? (activeVgca.Subject.match(/E=([^,]+)/) || [])[1] || '' : '',
+  school: 'TRƯỜNG TRUNG HỌC CƠ SỞ CHU VĂN AN', department: 'Tổ Toán - Tin',
+  issuer: activeVgca ? String(activeVgca.Issuer || '') : '', thumbprint: activeVgca ? String(activeVgca.Thumbprint || '') : '',
+  hasPrivateKey: activeVgca ? Boolean(activeVgca.HasPrivateKey) : false,
+  status: activeVgca ? (activeVgca.HasPrivateKey ? 'CONNECTED' : 'KEY_MISSING') : (detectedInfo.scanStatus || 'UNAVAILABLE')
 };
 
-if (detectedInfo.detectedVgca) {
-  const subj = detectedInfo.detectedVgca.Subject;
-  const cnMatch = subj.match(/CN=([^,]+)/);
-  const emailMatch = subj.match(/E=([^,]+)/);
-  const ouMatch = subj.match(/OU=([^,]+)/);
+if (detectedInfo && detectedInfo.detectedVgca) {
+  const subj = typeof detectedInfo.detectedVgca.Subject === 'string' ? detectedInfo.detectedVgca.Subject : '';
+  const cnMatch = subj ? subj.match(/CN=([^,]+)/) : null;
+  const emailMatch = subj ? subj.match(/E=([^,]+)/) : null;
+  const ouMatch = subj ? subj.match(/OU=([^,]+)/) : null;
   
   if (cnMatch && !cnMatch[1].includes('\ufffd')) realSigner.name = cnMatch[1].trim();
   if (emailMatch) realSigner.email = emailMatch[1].trim();
   if (ouMatch) realSigner.school = ouMatch[1].trim();
-  realSigner.issuer = detectedInfo.detectedVgca.Issuer;
-  realSigner.thumbprint = detectedInfo.detectedVgca.Thumbprint;
-  realSigner.hasPrivateKey = detectedInfo.detectedVgca.HasPrivateKey;
+  realSigner.issuer = typeof detectedInfo.detectedVgca.Issuer === 'string' ? detectedInfo.detectedVgca.Issuer : '';
+  realSigner.thumbprint = typeof detectedInfo.detectedVgca.Thumbprint === 'string' ? detectedInfo.detectedVgca.Thumbprint : '';
+  realSigner.hasPrivateKey = Boolean(detectedInfo.detectedVgca.HasPrivateKey);
+  if (realSigner.hasPrivateKey) realSigner.status = 'CONNECTED';
   console.log(`[VGCA] Đã phát hiện Chứng thư số Ban Cơ yếu: ${realSigner.name} (${realSigner.school})`);
 }
 
@@ -1407,14 +1408,18 @@ let signatureProfile = {
 };
 
 // ==================== 2. TOKEN-BASED AUTHENTICATION ====================
-const JWT_SECRET = process.env.JWT_SECRET || 'edusign_vgca_secure_token_secret_2026';
+const JWT_SECRET = (typeof process.env.JWT_SECRET === 'string' && process.env.JWT_SECRET.trim().length >= 32)
+  ? process.env.JWT_SECRET.trim()
+  : (process.env.NODE_ENV === 'production'
+      ? (() => { throw new Error('FATAL: JWT_SECRET môi trường sản xuất bắt buộc phải >= 32 ký tự.'); })()
+      : (crypto.randomBytes(32).toString('hex')));
 
 function generateToken(user) {
+  if (!user || typeof user !== 'object') return null;
+  if (!user.id || typeof user.username !== 'string' || typeof user.role !== 'string') return null;
+  const now = Date.now();
   const payload = {
-    id: user.id,
-    username: user.username,
-    role: user.role,
-    time: Date.now()
+    id: user.id, username: user.username, role: user.role, iat: now, exp: now + 7 * 24 * 60 * 60 * 1000
   };
   const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
   const signature = crypto.createHmac('sha256', JWT_SECRET).update(body).digest('base64url');
@@ -1423,23 +1428,18 @@ function generateToken(user) {
 
 function verifyToken(token) {
   try {
-    if (!token || typeof token !== 'string') return null;
-    let payload = null;
-    if (token.includes('.')) {
-      const parts = token.split('.');
-      if (parts.length === 2) {
-        const [body, signature] = parts;
-        const expectedSig = crypto.createHmac('sha256', JWT_SECRET).update(body).digest('base64url');
-        if (signature.length === expectedSig.length && crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSig))) {
-          payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-        }
-      }
-    } else {
-      // Fallback cho token base64 trong phiên chuyển giao
-      const json = Buffer.from(token, 'base64').toString('utf8');
-      payload = JSON.parse(json);
-    }
-    if (!payload || !payload.id) return null;
+    if (!token || typeof token !== 'string' || !token.includes('.')) return null;
+    const parts = token.split('.');
+    if (parts.length !== 2) return null;
+    const [body, signature] = parts;
+    if (!body || !signature) return null;
+    const expectedSig = crypto.createHmac('sha256', JWT_SECRET).update(body).digest('base64url');
+    if (signature.length !== expectedSig.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSig))) return null;
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    if (!Number.isFinite(payload.exp) || payload.exp <= Date.now()) return null;
+    if ((typeof payload.id !== 'string' && typeof payload.id !== 'number') || !payload.id) return null;
+    if (typeof payload.username !== 'string' || typeof payload.role !== 'string') return null;
     const user = dataStore.getUserById(payload.id, true);
     if (!user || user.status === 'LOCKED' || user.isLocked) return null;
     return user;
@@ -1450,34 +1450,34 @@ function verifyToken(token) {
 }
 
 function getCurrentUser(req) {
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7).trim();
-    const user = verifyToken(token);
-    if (user) return user;
-  }
-  const customToken = req.headers['x-auth-token'];
-  if (customToken) {
-    const user = verifyToken(customToken);
-    if (user) return user;
+  if (!req || typeof req !== 'object' || !req.headers) {
+    return null;
   }
 
-  // Hỗ trợ giáo viên chuyên môn hoạt động liên tục (GitHub Pages Hybrid Auth):
-  // Khi chạy client tĩnh mà token chưa kịp lưu hoặc phiên cũ chưa có token,
-  // đối soát danh tính giáo viên từ dataStore bằng x-user-id / x-user-username.
-  // TUYỆT ĐỐI CẤM: Không cấp quyền ADMIN hoặc BGH nếu thiếu Bearer Token hợp lệ!
-  const userId = req.headers['x-user-id'];
-  const userUsername = req.headers['x-user-username'];
-  if (userId || userUsername) {
-    let user = userId ? dataStore.getUserById(userId, true) : null;
-    if (!user && userUsername) user = dataStore.getUserByUsername(userUsername, true);
-    if (user && user.status !== 'LOCKED' && !user.isLocked) {
-      if (user.role !== 'ADMIN' && user.role !== 'BGH' && user.departmentId !== 'dept_bgh') {
+  // 1. Xác thực chính thức qua tiêu chuẩn Bearer Authorization Token
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.substring(7).trim();
+    if (token) {
+      const user = verifyToken(token);
+      if (user) {
         return user;
       }
     }
   }
 
+  // 2. Xác thực dự phòng qua tiêu chuẩn x-auth-token có chữ ký HMAC hợp lệ
+  const customToken = req.headers['x-auth-token'];
+  if (typeof customToken === 'string' && customToken.trim()) {
+    const token = customToken.trim();
+    const user = verifyToken(token);
+    if (user) {
+      return user;
+    }
+  }
+
+  // TUYỆT ĐỐI CẤM: Triệt tiêu hoàn toàn lỗ hổng Identity Spoofing qua header không chữ ký
+  // Không bao giờ tin cậy x-user-id hoặc x-user-username do client tự gửi khi thiếu Bearer JWT
   return null;
 }
 
@@ -1488,13 +1488,13 @@ async function resolveTargetUser(userIdOrUsername) {
   if (!userIdOrUsername) return null;
   const str = String(userIdOrUsername).trim();
   const lower = str.toLowerCase();
-  let user = (typeof dataStore.getUserById === 'function' ? dataStore.getUserById(str, true) : null) ||
-             (typeof dataStore.getUserByUsername === 'function' ? dataStore.getUserByUsername(str, true) : null);
+  let user = (typeof dataStore.getUserById === 'function' ? dataStore.getUserById(str, true) : null) || (typeof dataStore.getUserByUsername === 'function' ? dataStore.getUserByUsername(str, true) : null);
   if (user) return user;
 
-  // Tra cứu tự động thời gian thực từ Firebase RTDB
+  // Tra cứu tự động thời gian thực từ Firebase RTDB có timeout an toàn
+  const controller = new AbortController(), timeoutId = setTimeout(() => controller.abort(), 4000);
   try {
-    const fbRes = await fetch('https://edusign-school-default-rtdb.asia-southeast1.firebasedatabase.app/users.json');
+    const fbRes = await fetch('https://edusign-school-default-rtdb.asia-southeast1.firebasedatabase.app/users.json', { signal: controller.signal });
     if (fbRes.ok) {
       const fbData = await fbRes.json();
       const fbList = Array.isArray(fbData) ? fbData : Object.values(fbData || {});
@@ -1502,9 +1502,7 @@ async function resolveTargetUser(userIdOrUsername) {
       if (matched) {
         try {
           const curUsers = dataStore.getUsers();
-          if (!curUsers.some(x => x.id === matched.id || x.username === matched.username)) {
-            dataStore.saveUsers([...curUsers, matched]);
-          }
+          if (!curUsers.some(x => x.id === matched.id || x.username === matched.username)) dataStore.saveUsers([...curUsers, matched]);
         } catch (saveErr) {
           console.warn('[resolveTargetUser] Lỗi lưu cache dataStore:', saveErr.message);
         }
@@ -1512,7 +1510,9 @@ async function resolveTargetUser(userIdOrUsername) {
       }
     }
   } catch (err) {
-    console.warn('[resolveTargetUser] Lỗi tra cứu Firebase:', err.message);
+    console.warn('[resolveTargetUser] Lỗi tra cứu Firebase:', err && err.message ? err.message : err);
+  } finally {
+    clearTimeout(timeoutId);
   }
   return null;
 }
@@ -1539,18 +1539,18 @@ function requireAdmin(req, res, next) {
 
 // Đăng nhập hệ thống (Chỉ cần Tên đăng nhập và Mật khẩu)
 app.post('/api/auth/login', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) {
+  const { username, password } = req.body || {};
+  if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
     return res.status(400).json({ success: false, message: 'Vui lòng nhập đầy đủ tên đăng nhập và mật khẩu!' });
   }
-
   let user = (typeof dataStore.getUserByUsername === 'function') ? dataStore.getUserByUsername(username, true) : null;
-  if (!user) {
-    user = await resolveTargetUser(username);
-  }
-  if (!user || user.password !== password) {
+  if (!user) user = await resolveTargetUser(username);
+  const storedHash = user ? (user.passwordHash || user.password) : null;
+  const isMatch = Boolean(user && storedHash && typeof dataStore.verifyPassword === 'function' && (await dataStore.verifyPassword(password, storedHash)));
+  if (!user || !isMatch) {
     return res.status(401).json({ success: false, message: 'Tên đăng nhập hoặc mật khẩu không chính xác!' });
   }
+  // Xác thực danh tính và kiểm tra trạng thái khóa tài khoản
 
   // Chặn đăng nhập nếu tài khoản bị Admin tạm khóa
   if (user.status === 'LOCKED') {
@@ -1617,19 +1617,19 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 });
 
 // Đổi mật khẩu
-app.post('/api/auth/change-password', requireAuth, (req, res) => {
-  const { currentPassword, newPassword } = req.body;
-  const user = req.user;
-  
-  if (user.password !== currentPassword) {
-    return res.status(400).json({ success: false, message: 'Mật khẩu hiện tại không đúng!' });
+app.post('/api/auth/change-password', requireAuth, async (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+  const freshUser = (req.user && req.user.id) ? (dataStore.getUserById(req.user.id, true) || req.user) : req.user;
+  const storedPass = freshUser ? (freshUser.passwordHash || freshUser.password) : null;
+  const isMatch = Boolean(freshUser && storedPass && typeof dataStore.verifyPassword === 'function' && (await dataStore.verifyPassword(currentPassword, storedPass)));
+  if (!isMatch) return res.status(400).json({ success: false, message: 'Mật khẩu hiện tại không đúng!' });
+  if (typeof newPassword !== 'string' || newPassword.length < 8 || !newPassword.trim()) {
+    return res.status(400).json({ success: false, message: 'Mật khẩu mới phải có ít nhất 8 ký tự!' });
   }
-  if (!newPassword || newPassword.length < 4) {
-    return res.status(400).json({ success: false, message: 'Mật khẩu mới phải có ít nhất 4 ký tự!' });
-  }
-
-  dataStore.resetPassword(user.id, newPassword);
-  res.json({ success: true, message: 'Đổi mật khẩu thành công!' });
+  try {
+    dataStore.resetPassword(freshUser.id, newPassword);
+    return res.json({ success: true, message: 'Đổi mật khẩu thành công!' });
+  } catch (err) { return res.status(400).json({ success: false, message: err && err.message ? err.message : 'Lỗi đổi mật khẩu!' }); }
 });
 
 // Danh sách tổ chuyên môn (Public & tương thích ngược)
@@ -1655,23 +1655,23 @@ app.get('/api/admin/departments', requireAdmin, (req, res) => {
 });
 
 app.post('/api/admin/departments', requireAdmin, (req, res) => {
-  const { name, code, description, leaderId } = req.body;
-  if (!name) return res.status(400).json({ success: false, message: 'Vui lòng nhập Tên tổ chuyên môn!' });
+  const { name, code, description, leaderId } = req.body || {};
+  if (!name || typeof name !== 'string' || !name.trim()) return res.status(400).json({ success: false, message: 'Vui lòng nhập Tên tổ chuyên môn!' });
   try {
-    const newDept = dataStore.createDepartment({ name, code, description, leaderId });
+    const newDept = dataStore.createDepartment({ name: name.trim(), code, description, leaderId });
     res.json({ success: true, message: `Đã tạo tổ "${newDept.name}" thành công!`, data: newDept });
   } catch (err) {
-    res.status(400).json({ success: false, message: err.message });
+    res.status(400).json({ success: false, message: (err && err.message) ? err.message : 'Lỗi tạo tổ chuyên môn!' });
   }
 });
 
 app.put('/api/admin/departments/:id', requireAdmin, (req, res) => {
+  const { name, code, description, leaderId } = req.body || {};
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) return res.status(400).json({ success: false, message: 'Dữ liệu không hợp lệ!' });
   try {
-    const updated = dataStore.updateDepartment(req.params.id, req.body);
+    const updated = dataStore.updateDepartment(req.params.id, { name: typeof name === 'string' ? name.trim() : name, code, description, leaderId });
     res.json({ success: true, message: `Đã cập nhật thông tin tổ "${updated.name}"!`, data: updated });
-  } catch (err) {
-    res.status(400).json({ success: false, message: err.message });
-  }
+  } catch (err) { return res.status(400).json({ success: false, message: (err && err.message) ? err.message : 'Lỗi cập nhật tổ chuyên môn!' }); }
 });
 
 app.delete('/api/admin/departments/:id', requireAdmin, (req, res) => {
@@ -1679,7 +1679,7 @@ app.delete('/api/admin/departments/:id', requireAdmin, (req, res) => {
     dataStore.deleteDepartment(req.params.id);
     res.json({ success: true, message: 'Đã xóa tổ chuyên môn thành công!' });
   } catch (err) {
-    res.status(400).json({ success: false, message: err.message });
+    res.status(400).json({ success: false, message: (err && err.message) ? err.message : 'Lỗi xóa tổ chuyên môn!' });
   }
 });
 
@@ -1700,7 +1700,7 @@ app.get('/api/admin/users', requireAdmin, (req, res) => {
     cccd: u.cccd || '',
     email: u.email,
     phone: u.phone,
-    pinCode: u.pinCode || ((u.phone && u.phone.replace(/\D/g, '').length >= 4) ? u.phone.replace(/\D/g, '').slice(-4) : '1234'),
+    hasPinCode: Boolean(u.pinCode || u.zaloPin),
     canUploadWord: u.canUploadWord !== false,
     createdAt: u.createdAt
   }));
@@ -1709,29 +1709,29 @@ app.get('/api/admin/users', requireAdmin, (req, res) => {
 
 // Tạo tài khoản giáo viên mới (Chỉ định Tổ bộ môn, Vai trò & Loại chữ ký số)
 app.post('/api/admin/users', requireAdmin, (req, res) => {
-  const { id, username, password, name, role, roleTitle, department, departmentId, signType, email, phone, cccd, canUploadWord, canStampSeal, pinCode, zaloPin } = req.body;
-  if (!username || !name || !department) {
-    return res.status(400).json({ success: false, message: 'Vui lòng điền đủ Tên đăng nhập, Họ và tên và Tổ bộ môn!' });
-  }
-
+  const { id, username, password, name, role, roleTitle, department, departmentId, signType, email, phone, cccd, canUploadWord, canStampSeal, pinCode, zaloPin } = req.body || {};
+  const uName = typeof username === 'string' ? username.trim() : '', fullName = typeof name === 'string' ? name.trim() : '', deptName = typeof department === 'string' ? department.trim() : '';
+  if (!uName || !fullName || !deptName || !/^[a-zA-Z0-9_.@-]{3,50}$/.test(uName)) return res.status(400).json({ success: false, message: 'Tên đăng nhập (3-50 ký tự), Họ tên và Tổ chuyên môn là bắt buộc!' });
+  const cleanEmail = (typeof email === 'string' && email.trim()) ? email.trim() : undefined, cleanPhone = (typeof phone === 'string' && phone.trim()) ? phone.trim() : undefined;
+  if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) return res.status(400).json({ success: false, message: 'Định dạng email không hợp lệ!' });
+  if (cleanPhone && !/^[0-9+() -]{9,15}$/.test(cleanPhone)) return res.status(400).json({ success: false, message: 'Số điện thoại không hợp lệ!' });
+  const cleanCccd = (typeof cccd === 'string' && cccd.trim()) ? cccd.trim() : '', rawPin = (typeof pinCode === 'string' && pinCode.trim()) ? pinCode.trim() : (typeof zaloPin === 'string' ? zaloPin.trim() : '');
+  if (cleanCccd && !/^[0-9]{9,12}$/.test(cleanCccd)) return res.status(400).json({ success: false, message: 'Số CCCD phải gồm 9-12 chữ số!' });
+  if (rawPin && !/^\d{4,6}$/.test(rawPin)) return res.status(400).json({ success: false, message: 'Mã PIN không hợp lệ (4-6 chữ số)!' });
+  const validRoles = ['TEACHER', 'HEAD_DEPT', 'BGH', 'ADMIN'], userRole = (typeof role === 'string' && validRoles.includes(role.trim().toUpperCase())) ? role.trim().toUpperCase() : 'TEACHER';
+  const validSigns = ['VGCA', 'USB_TOKEN', 'SMART_CA'], userSign = (typeof signType === 'string' && validSigns.includes(signType.trim().toUpperCase())) ? signType.trim().toUpperCase() : (userRole === 'BGH' || userRole === 'ADMIN' ? 'USB_TOKEN' : 'VGCA');
+  const userPass = (typeof password === 'string' && password.trim().length > 0) ? password.trim() : undefined, hashedPin = rawPin ? dataStore.hashPasswordSync(rawPin) : undefined;
+  const targetDeptId = (departmentId && typeof dataStore.getDepartmentById === 'function' && dataStore.getDepartmentById(departmentId)) ? String(departmentId).trim() : null;
   try {
     const newUser = dataStore.createUser({
-      id: id || undefined,
-      username,
-      password: password || '123456',
-      name,
-      role: role || 'TEACHER', // TEACHER, HEAD_DEPT, BGH, ADMIN
-      roleTitle: roleTitle || undefined,
-      department,
-      departmentId: departmentId || null,
-      signType: signType || (role === 'BGH' || role === 'ADMIN' ? 'USB_TOKEN' : 'VGCA'),
-      status: 'ACTIVE',
-      email,
-      phone,
-      cccd: cccd || '',
-      pinCode: pinCode || zaloPin || undefined,
-      canUploadWord: canUploadWord !== undefined ? Boolean(canUploadWord) : true,
-      canStampSeal: (role === 'ADMIN') ? false : (canStampSeal !== undefined ? Boolean(canStampSeal) : false)
+      id: (typeof id === 'string' && id.trim()) ? id.trim() : undefined, username: uName, password: userPass,
+      name: fullName.slice(0, 100), role: userRole, roleTitle: typeof roleTitle === 'string' ? roleTitle.trim() : undefined,
+      department: deptName, departmentId: targetDeptId, signType: userSign, status: 'ACTIVE',
+      email: cleanEmail, phone: cleanPhone,
+      cccd: cleanCccd,
+      pinCode: hashedPin,
+      canUploadWord: typeof canUploadWord === 'boolean' ? canUploadWord : true,
+      canStampSeal: (userRole === 'ADMIN') ? false : (typeof canStampSeal === 'boolean' ? canStampSeal : false)
     });
     res.json({
       success: true,
@@ -1740,17 +1740,15 @@ app.post('/api/admin/users', requireAdmin, (req, res) => {
         id: newUser.id,
         username: newUser.username,
         name: newUser.name,
-        role: newUser.role,
-        roleTitle: newUser.roleTitle,
+        role: newUser.role, roleTitle: newUser.roleTitle,
         department: newUser.department,
         signType: newUser.signType,
-        canUploadWord: newUser.canUploadWord !== false,
-        canStampSeal: newUser.canStampSeal === true,
+        canUploadWord: newUser.canUploadWord !== false, canStampSeal: newUser.canStampSeal === true,
         status: newUser.status
       }
     });
   } catch (err) {
-    res.status(400).json({ success: false, message: err.message });
+    res.status(400).json({ success: false, message: (err && err.message) ? err.message : 'Lỗi tạo tài khoản!' });
   }
 });
 
@@ -1763,38 +1761,40 @@ app.put('/api/admin/users/:id/toggle-lock', requireAdmin, (req, res) => {
       success: true,
       message: isLocked ? `Đã tạm khóa tài khoản: ${user.name}` : `Đã mở khóa tài khoản: ${user.name}`,
       status: user.status,
-      data: user
+      data: { id: user.id, username: user.username, name: user.name, role: user.role, status: user.status }
     });
   } catch (err) {
-    res.status(400).json({ success: false, message: err.message });
+    res.status(400).json({ success: false, message: (err && err.message) ? err.message : 'Lỗi thay đổi trạng thái khóa!' });
   }
 });
 
 // Chỉnh sửa thông tin giáo viên (Phân quyền lại Tổ trưởng, chuyển Tổ, đổi Loại chữ ký)
 app.put('/api/admin/users/:id', requireAdmin, (req, res) => {
   try {
-    const updated = dataStore.updateUser(req.params.id, req.body);
+    const b = req.body || {}, allowed = ['name', 'role', 'roleTitle', 'department', 'departmentId', 'signType', 'email', 'phone', 'cccd', 'canUploadWord', 'canStampSeal'];
+    const safeBody = {}; allowed.forEach(k => { if (b[k] !== undefined) safeBody[k] = b[k]; });
+    const updated = dataStore.updateUser(req.params.id, safeBody);
     res.json({
       success: true,
       message: `Đã cập nhật thông tin cho: ${updated.name}`,
-      data: updated
+      data: { id: updated.id, username: updated.username, name: updated.name, role: updated.role, department: updated.department, status: updated.status }
     });
   } catch (err) {
-    res.status(400).json({ success: false, message: err.message });
+    res.status(400).json({ success: false, message: (err && err.message) ? err.message : 'Lỗi cập nhật người dùng!' });
   }
 });
 
 // Đặt lại mật khẩu giáo viên về mặc định
 app.post('/api/admin/users/:id/reset-password', requireAdmin, (req, res) => {
-  const { newPassword } = req.body;
+  const { newPassword } = req.body || {}; const targetPass = (typeof newPassword === 'string' && newPassword.trim().length >= 8) ? newPassword.trim() : undefined;
   try {
-    dataStore.resetPassword(req.params.id, newPassword || '123456');
+    dataStore.resetPassword(req.params.id, targetPass);
     res.json({
       success: true,
-      message: `Đã đặt lại mật khẩu thành công! Mật khẩu mới: ${newPassword || '123456'}`
+      message: 'Đã đặt lại mật khẩu thành công! Vui lòng yêu cầu người dùng đổi mật khẩu ở lần đăng nhập tiếp theo.'
     });
   } catch (err) {
-    res.status(400).json({ success: false, message: err.message });
+    res.status(400).json({ success: false, message: (err && err.message) ? err.message : 'Lỗi đặt lại mật khẩu!' });
   }
 });
 
@@ -1804,7 +1804,7 @@ app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
     dataStore.deleteUser(req.params.id);
     res.json({ success: true, message: 'Đã xóa tài khoản thành công!' });
   } catch (err) {
-    res.status(400).json({ success: false, message: err.message });
+    res.status(400).json({ success: false, message: (err && err.message) ? err.message : 'Lỗi xóa tài khoản!' });
   }
 });
 
@@ -1822,11 +1822,11 @@ app.get('/api/push/vapid-public-key', (req, res) => {
 });
 
 app.post('/api/push/subscribe', requireAuth, (req, res) => {
-  const { subscription } = req.body;
-  if (!subscription || !subscription.endpoint) {
-    return res.status(400).json({ success: false, message: 'Thiếu dữ liệu subscription' });
-  }
-  dataStore.saveSubscription(req.user.id, subscription);
+  const sub = req.body && req.body.subscription, ep = (sub && typeof sub.endpoint === 'string') ? sub.endpoint.trim() : '';
+  const keys = (sub && typeof sub.keys === 'object' && sub.keys) ? sub.keys : {}, p256 = typeof keys.p256dh === 'string' ? keys.p256dh.trim() : '', authKey = typeof keys.auth === 'string' ? keys.auth.trim() : '';
+  if (!ep.startsWith('https://') || ep.length > 1024 || !p256 || !authKey || p256.length > 256 || authKey.length > 128)
+    return res.status(400).json({ success: false, message: 'Dữ liệu subscription Web Push không hợp lệ (yêu cầu https, p256dh, auth)!' });
+  dataStore.saveSubscription(req.user.id, { endpoint: ep, keys: { p256dh: p256, auth: authKey } });
   res.json({ success: true, message: 'Đã đăng ký nhận thông báo Web Push thành công!' });
 });
 
@@ -1838,25 +1838,25 @@ app.get('/api/user/signature', requireAuth, (req, res) => {
   });
 });
 
-app.post('/api/user/signature', requireAuth, (req, res) => {
-  const { signatureImage } = req.body;
-  if (!signatureImage) {
-    return res.status(400).json({ success: false, message: 'Chưa có dữ liệu ảnh chữ ký!' });
+app.post('/api/user/signature', requireAuth, async (req, res) => {
+  const { signatureImage } = req.body || {};
+  if (!signatureImage || typeof signatureImage !== 'string' || signatureImage.length > 2 * 1024 * 1024) {
+    return res.status(400).json({ success: false, message: 'Dữ liệu ảnh chữ ký không hợp lệ hoặc vượt quá 2MB!' });
   }
-
-  // Lưu vào database người dùng
-  const updatedUser = dataStore.updateUser(req.user.id, { signatureImage });
-  
-  // Tự động đồng bộ mẫu chữ ký lên Firebase Realtime Database (/signatures/{userId}.json)
-  dataStore.syncSignatureToFirebase(req.user.id, signatureImage);
-
-  // Lưu file ảnh chữ ký vào ổ đĩa
+  const match = signatureImage.match(/^data:image\/png;base64,([A-Za-z0-9+/=]+)$/);
+  if (!match) return res.status(400).json({ success: false, message: 'Định dạng ảnh chữ ký phải là Data URL Base64 PNG!' });
+  const buf = Buffer.from(match[1], 'base64'), pngMagic = Buffer.from('89504e470d0a1a0a', 'hex');
+  if (buf.length < 8 || !buf.subarray(0, 8).equals(pngMagic)) return res.status(400).json({ success: false, message: 'Dữ liệu tệp không phải định dạng PNG hợp lệ!' });
+  const sigDir = path.join(__dirname, 'uploads', 'signatures'), tmpFile = path.join(sigDir, `.tmp_${req.user.id}_${Date.now()}.png`), targetFile = path.join(sigDir, `sig_${req.user.id}.png`); let updatedUser;
   try {
-    const base64Data = signatureImage.replace(/^data:image\/\w+;base64,/, '');
-    const sigPath = path.join(__dirname, 'uploads', 'signatures', `sig_${req.user.id}.png`);
-    fs.writeFileSync(sigPath, Buffer.from(base64Data, 'base64'));
+    if (!fs.existsSync(sigDir)) fs.mkdirSync(sigDir, { recursive: true });
+    await fs.promises.writeFile(tmpFile, buf);
+    await fs.promises.rename(tmpFile, targetFile);
+    updatedUser = dataStore.updateUser(req.user.id, { signatureImage });
+    try { if (typeof dataStore.syncSignatureToFirebase === 'function') await dataStore.syncSignatureToFirebase(req.user.id, signatureImage); } catch (e) { console.warn('[Firebase Sig Sync]', e && e.message); }
   } catch (err) {
-    console.error('Lỗi lưu file chữ ký vật lý:', err.message);
+    if (fs.existsSync(tmpFile)) { try { await fs.promises.unlink(tmpFile); } catch (cleanErr) { console.warn('[Sig Cleanup]', cleanErr && cleanErr.message); } }
+    return res.status(500).json({ success: false, message: (err && err.message) ? err.message : 'Lỗi lưu trữ tệp chữ ký vật lý!' });
   }
 
   res.json({
@@ -1867,51 +1867,51 @@ app.post('/api/user/signature', requireAuth, (req, res) => {
 });
 
 // Quản lý con dấu đỏ điện tử của nhà trường (Dành cho Admin, BGH và người được ủy quyền)
-app.get('/api/school-seal', (req, res) => {
-  const sealUploadPath = path.join(__dirname, 'uploads', 'signatures', 'school_seal.png');
-  const sealRootPath = path.join(__dirname, 'school_seal.png');
-  const targetPath = fs.existsSync(sealUploadPath) ? sealUploadPath : (fs.existsSync(sealRootPath) ? sealRootPath : null);
-
-  if (targetPath) {
-    const sealBase64 = `data:image/png;base64,${fs.readFileSync(targetPath).toString('base64')}`;
-    return res.json({ success: true, sealImage: sealBase64, exists: true });
+app.get('/api/school-seal', requireAuth, (req, res) => {
+  try {
+    const sealUploadPath = path.join(__dirname, 'uploads', 'signatures', 'school_seal.png');
+    const sealRootPath = path.join(__dirname, 'school_seal.png');
+    const targetPath = fs.existsSync(sealUploadPath) ? sealUploadPath : (fs.existsSync(sealRootPath) ? sealRootPath : null);
+    if (targetPath) {
+      const sealBase64 = `data:image/png;base64,${fs.readFileSync(targetPath).toString('base64')}`;
+      return res.json({ success: true, sealImage: sealBase64, exists: true });
+    }
+    return res.json({ success: true, sealImage: null, exists: false });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: (err && err.message) ? err.message : 'Lỗi đọc tệp con dấu!' });
   }
-  res.json({ success: true, sealImage: null, exists: false });
 });
 
 app.post('/api/school-seal', requireAuth, (req, res) => {
   if (req.user.role !== 'ADMIN' && !req.user.canStampSeal) {
     return res.status(403).json({ success: false, message: 'Chỉ Quản trị viên hoặc người được ủy quyền con dấu mới có quyền tải lên con dấu nhà trường!' });
   }
-
-  const { sealImage } = req.body;
-  if (!sealImage) {
-    return res.status(400).json({ success: false, message: 'Chưa có dữ liệu ảnh con dấu!' });
+  const { sealImage } = req.body || {};
+  if (typeof sealImage !== 'string' || !/^data:image\/\w+;base64,/.test(sealImage)) {
+    return res.status(400).json({ success: false, message: 'Dữ liệu ảnh con dấu không hợp lệ!' });
   }
-
   try {
     const base64Data = sealImage.replace(/^data:image\/\w+;base64,/, '');
+    const buf = Buffer.from(base64Data, 'base64');
+    if (buf.length === 0 || buf.length > 2 * 1024 * 1024) {
+      return res.status(400).json({ success: false, message: 'Dữ liệu ảnh con dấu không hợp lệ hoặc vượt quá 2MB!' });
+    }
     const sealUploadPath = path.join(__dirname, 'uploads', 'signatures', 'school_seal.png');
     const sealRootPath = path.join(__dirname, 'school_seal.png');
-    const buf = Buffer.from(base64Data, 'base64');
-    
     fs.mkdirSync(path.dirname(sealUploadPath), { recursive: true });
     fs.writeFileSync(sealUploadPath, buf);
     fs.writeFileSync(sealRootPath, buf);
-
-    try {
-      dataStore.syncSignatureToFirebase('school_seal', sealImage);
-    } catch (e) {
-      console.warn('[server.js] Cảnh báo đồng bộ con dấu lên Firebase thất bại:', e.message);
+    if (typeof dataStore.syncSignatureToFirebase === 'function') {
+      Promise.resolve(dataStore.syncSignatureToFirebase('school_seal', sealImage))
+        .catch(e => console.warn('[server.js] Cảnh báo đồng bộ con dấu lên Firebase thất bại:', (e && e.message) ? e.message : e));
     }
-
-    res.json({
+    return res.json({
       success: true,
       message: 'Đã lưu con dấu đỏ nhà trường thành công!',
       sealImage
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: `Lỗi lưu con dấu: ${err.message}` });
+    return res.status(500).json({ success: false, message: `Lỗi lưu con dấu: ${(err && err.message) ? err.message : 'Lỗi hệ thống'}` });
   }
 });
 
@@ -1923,27 +1923,27 @@ app.get('/api/signatures/mine', requireAuth, (req, res) => {
   });
 });
 
-app.post('/api/signatures/mine', requireAuth, (req, res) => {
-  const { signatureImage } = req.body;
-  if (!signatureImage) {
-    return res.status(400).json({ success: false, message: 'Chưa có dữ liệu ảnh chữ ký!' });
-  }
-  const updatedUser = dataStore.updateUser(req.user.id, { signatureImage });
-  
-  // Tự động đồng bộ mẫu chữ ký lên Firebase Realtime Database
-  dataStore.syncSignatureToFirebase(req.user.id, signatureImage);
-
+app.post('/api/signatures/mine', requireAuth, async (req, res) => { const { signatureImage } = req.body || {}, safeUid = String(req.user && req.user.id || '').trim();
+  if (!safeUid || !/^[a-zA-Z0-9_-]+$/.test(safeUid)) return res.status(400).json({ success: false, message: 'Định danh người dùng không hợp lệ!' });
+  if (!signatureImage || typeof signatureImage !== 'string' || signatureImage.length > 2 * 1024 * 1024) return res.status(400).json({ success: false, message: 'Dữ liệu ảnh chữ ký không hợp lệ hoặc vượt quá 2MB!' });
+  const match = signatureImage.match(/^data:image\/png;base64,([A-Za-z0-9+/=]+)$/); if (!match) return res.status(400).json({ success: false, message: 'Định dạng ảnh chữ ký phải là Data URL Base64 PNG!' });
+  const buf = Buffer.from(match[1], 'base64'), pngMagic = Buffer.from('89504e470d0a1a0a', 'hex');
+  if (buf.length < 8 || !buf.subarray(0, 8).equals(pngMagic)) return res.status(400).json({ success: false, message: 'Dữ liệu tệp không phải định dạng PNG hợp lệ!' });
+  const sigDir = path.join(__dirname, 'uploads', 'signatures'), tmpFile = path.join(sigDir, `.tmp_${safeUid}_${Date.now()}.png`), targetFile = path.join(sigDir, `sig_${safeUid}.png`); let updatedUser, fileRenamed = false;
   try {
-    const base64Data = signatureImage.replace(/^data:image\/\w+;base64,/, '');
-    const sigPath = path.join(__dirname, 'uploads', 'signatures', `sig_${req.user.id}.png`);
-    fs.writeFileSync(sigPath, Buffer.from(base64Data, 'base64'));
-  } catch (err) {
-    console.error('Lỗi lưu file chữ ký vật lý:', err.message);
+    if (!fs.existsSync(sigDir)) fs.mkdirSync(sigDir, { recursive: true }); await fs.promises.writeFile(tmpFile, buf);
+    await fs.promises.rename(tmpFile, targetFile); fileRenamed = true;
+    updatedUser = dataStore.updateUser(req.user.id, { signatureImage });
+    if (typeof dataStore.syncSignatureToFirebase === 'function') { Promise.resolve(dataStore.syncSignatureToFirebase(req.user.id, signatureImage)).catch(e => console.warn('[Firebase Sig Sync]', (e && e.message) ? e.message : e)); }
+  } catch (err) { console.error('[Signatures Mine Error]', err && err.message);
+    if (fs.existsSync(tmpFile)) { try { await fs.promises.unlink(tmpFile); } catch (cErr) { console.warn('[Sig Cleanup]', cErr && cErr.message); } }
+    if (fileRenamed && !updatedUser && fs.existsSync(targetFile)) { try { await fs.promises.unlink(targetFile); } catch (tErr) { console.warn('[Target Cleanup]', tErr && tErr.message); } }
+    return res.status(500).json({ success: false, message: 'Không thể lưu tệp chữ ký, vui lòng thử lại!' });
   }
   res.json({
     success: true,
     message: 'Đã lưu mẫu chữ ký tay trong suốt thành công!',
-    signatureImage: updatedUser.signatureImage
+    signatureImage: updatedUser ? updatedUser.signatureImage : null
   });
 });
 
@@ -2007,8 +2007,8 @@ app.get('/api/documents', requireAuth, (req, res) => {
 });
 
 // Lấy danh sách hồ sơ đang chờ người dùng hiện tại ký (Hồ sơ chờ ký)
-app.get('/api/documents/pending', (req, res) => {
-  const headerId = req.headers['x-user-id'] || req.headers['x-user-username'] || (req.user && (req.user.id || req.user.username));
+app.get('/api/documents/pending', requireAuth, (req, res) => {
+  const headerId = req.user.id, headerUsername = req.user.username || headerId;
   if (!headerId) {
     return res.status(401).json({ success: false, message: 'Chưa xác định người dùng.' });
   }
@@ -2016,9 +2016,9 @@ app.get('/api/documents/pending', (req, res) => {
   const allDocs = dataStore.getDocuments();
   const pendingDocs = allDocs.filter(d => {
     if (!d || d.status !== 'PENDING_SIGN') return false;
-    const isAssigned = (d.assignedTo && (d.assignedTo === headerId)) ||
-                       (d.currentSignerId && (d.currentSignerId === headerId)) ||
-                       (d.nextSignerId && (d.nextSignerId === headerId));
+    const isAssigned = (d.assignedTo && (d.assignedTo === headerId || d.assignedTo === headerUsername)) ||
+                       (d.currentSignerId && (d.currentSignerId === headerId || d.currentSignerId === headerUsername)) ||
+                       (d.nextSignerId && (d.nextSignerId === headerId || d.nextSignerId === headerUsername));
     return Boolean(isAssigned);
   });
 
@@ -2032,24 +2032,24 @@ app.get('/api/documents/pending', (req, res) => {
 });
 
 // Lấy danh sách hồ sơ liên quan đến người dùng hiện tại (Hồ sơ tôi đã gửi / Đã tham gia ký / Hoàn tất)
-app.get('/api/documents/sent', (req, res) => {
-  const headerId = req.headers['x-user-id'] || req.headers['x-user-username'] || (req.user && (req.user.id || req.user.username));
-  const headerUsername = req.headers['x-user-username'] || (req.user && req.user.username) || headerId;
-  const headerFullName = decodeURIComponent(req.headers['x-user-fullname'] || (req.user && req.user.fullName) || '');
+app.get('/api/documents/sent', requireAuth, (req, res) => {
+  const headerId = req.user.id;
+  const headerUsername = req.user.username || headerId;
+  const headerFullName = req.user.fullName || req.user.name || '';
   if (!headerId) {
     return res.status(401).json({ success: false, message: 'Chưa xác định người dùng.' });
   }
 
-  const normName = normalizeVietnamese(headerFullName);
   const allDocs = dataStore.getDocuments();
   const sentDocs = allDocs.filter(d => {
     if (!d) return false;
     const isCreator = d.creatorId === headerId || d.creatorUsername === headerId || d.authorId === headerId || d.authorUsername === headerId ||
                       d.creatorId === headerUsername || d.creatorUsername === headerUsername || d.authorId === headerUsername || d.authorUsername === headerUsername;
     const isSigner = Array.isArray(d.signatures) && d.signatures.some(s => 
-      s.signerId === headerId || s.signerUsername === headerId ||
-      s.signerId === headerUsername || s.signerUsername === headerUsername ||
-      (normName && normalizeVietnamese(s.signerName) === normName)
+      s && typeof s === 'object' && (
+        s.signerId === headerId || s.signerUsername === headerId ||
+        s.signerId === headerUsername || s.signerUsername === headerUsername
+      )
     );
     const isAssigned = d.assignedTo === headerId || d.currentSignerId === headerId || d.assignedTo === headerUsername || d.currentSignerId === headerUsername;
     return Boolean(isCreator || isSigner || isAssigned);
@@ -2065,9 +2065,9 @@ app.get('/api/documents/sent', (req, res) => {
 });
 
 // Lấy danh sách hồ sơ bị trả về
-app.get('/api/documents/returned', (req, res) => {
-  const headerId = req.headers['x-user-id'] || req.headers['x-user-username'] || (req.user && (req.user.id || req.user.username));
-  const headerUsername = req.headers['x-user-username'] || (req.user && req.user.username) || headerId;
+app.get('/api/documents/returned', requireAuth, (req, res) => {
+  const headerId = req.user.id;
+  const headerUsername = req.user.username || headerId;
   if (!headerId) {
     return res.status(401).json({ success: false, message: 'Chưa xác định người dùng.' });
   }
@@ -2094,28 +2094,27 @@ app.get('/api/documents/returned', (req, res) => {
 
 // Chuẩn hóa chuỗi tiếng Việt không dấu để so khớp tên an toàn
 function normalizeVietnamese(s) {
-  return (s || '')
-    .normalize('NFD')
+  if (typeof s !== 'string') return '';
+  return s.normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/đ/g, 'd')
-    .replace(/Đ/g, 'D')
+    .replace(/[đĐ]/g, 'd')
     .toLowerCase()
     .replace(/[^a-z0-9]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
+// Chuẩn hóa tên tiếng Việt kết thúc
 
 // Xóa hoặc thu hồi hồ sơ do người dùng tạo (GV A xóa hồ sơ của mình)
-app.delete('/api/documents/:id', (req, res) => {
+app.delete('/api/documents/:id', requireAuth, (req, res) => {
   try {
-    const currentUser = req.user || getCurrentUser(req);
-    const headerId = (currentUser && currentUser.id) || (req.headers['x-user-id'] || '').trim();
-    const headerUsername = ((currentUser && currentUser.username) || req.headers['x-user-username'] || '').trim().toLowerCase();
-    const headerFullName = (currentUser && (currentUser.name || currentUser.fullName)) || decodeURIComponent(req.headers['x-user-fullname'] || '').trim();
-    const userRole = ((currentUser && currentUser.role) || req.headers['x-user-role'] || '').toUpperCase();
+    const currentUser = req.user;
+    const userId = (currentUser && currentUser.id) ? String(currentUser.id).trim() : '';
+    const username = (currentUser && currentUser.username) ? String(currentUser.username).trim().toLowerCase() : '';
+    const userRole = (currentUser && currentUser.role) ? String(currentUser.role).trim().toUpperCase() : '';
     const { id } = req.params;
 
-    const hasIdentifier = Boolean(headerId || headerUsername || headerFullName);
+    const hasIdentifier = Boolean(userId || username);
     if (!hasIdentifier && userRole !== 'ADMIN' && userRole !== 'BGH') {
       return res.status(401).json({ success: false, message: 'Vui lòng đăng nhập để thực hiện thao tác xóa hồ sơ.' });
     }
@@ -2126,25 +2125,28 @@ app.delete('/api/documents/:id', (req, res) => {
       return res.json({ success: true, message: 'Đã xóa hồ sơ khỏi hệ thống.' });
     }
 
-    // Kiểm tra quyền xóa: người tạo, tác giả hoặc quản trị viên / BGH
-    const normHeaderName = normalizeVietnamese(headerFullName);
-    const normAuthor = normalizeVietnamese(doc.author || doc.authorName || '');
-    const normCreator = normalizeVietnamese(doc.creatorName || '');
-
-    // Kiểm tra xem người dùng có phải là người ký hoặc người tạo hồ sơ không
+    // Kiểm tra quyền xóa: chỉ người tạo, tác giả, người ký hoặc quản trị viên / BGH
     const isSignedByUser = Array.isArray(doc.signatures) && doc.signatures.some(sig => {
-      if (headerId && sig.signerId === headerId) return true;
-      if (headerUsername && (sig.signerUsername || '').toLowerCase() === headerUsername) return true;
-      if (normHeaderName && normalizeVietnamese(sig.signerName) === normHeaderName) return true;
-      return false;
+      if (!sig || typeof sig !== 'object') return false;
+      const sId = (sig.signerId !== undefined && sig.signerId !== null) ? String(sig.signerId) : '';
+      const sUser = typeof sig.signerUsername === 'string' ? sig.signerUsername.trim().toLowerCase() : '';
+      return Boolean((userId && sId === String(userId)) || (username && sUser === username));
     });
+    const cId = (doc.creatorId !== undefined && doc.creatorId !== null) ? String(doc.creatorId) : '';
+    const aId = (doc.authorId !== undefined && doc.authorId !== null) ? String(doc.authorId) : '';
+    const cUser = typeof doc.creatorUsername === 'string' ? doc.creatorUsername.trim().toLowerCase() : '';
+    const aUser = typeof doc.authorUsername === 'string' ? doc.authorUsername.trim().toLowerCase() : '';
+    const isCreator = (
+      (userId && (cId === String(userId) || aId === String(userId))) || (username && (cUser === username || aUser === username))
+    );
+    const isPrivileged = (
+      userRole === 'ADMIN' ||
+      userRole === 'BGH'
+    );
 
     const isOwner = (
-      userRole === 'ADMIN' ||
-      userRole === 'BGH' ||
-      (headerId && (doc.creatorId === headerId || doc.authorId === headerId)) ||
-      (headerUsername && ((doc.creatorUsername || '').toLowerCase() === headerUsername || (doc.authorUsername || '').toLowerCase() === headerUsername)) ||
-      (normHeaderName && (normHeaderName === normAuthor || normHeaderName === normCreator)) ||
+      isPrivileged ||
+      isCreator ||
       isSignedByUser
     );
 
@@ -2154,30 +2156,28 @@ app.delete('/api/documents/:id', (req, res) => {
 
     dataStore.deleteDocument(id);
     res.json({ success: true, message: 'Đã xóa / thu hồi hồ sơ thành công!' });
-  } catch (err) {
-    console.error('[KÝ SỐ server.js] Lỗi xóa hồ sơ:', err);
-    res.status(500).json({ success: false, message: 'Lỗi khi xóa hồ sơ: ' + err.message });
+  } catch (err) { console.error('[KÝ SỐ server.js] Lỗi xóa hồ sơ:', (err && err.message) ? err.message : err); return res.status(500).json({ success: false, message: 'Lỗi khi xóa hồ sơ, vui lòng thử lại!' });
   }
 });
 
 // Hàm sinh Mã ID theo dõi văn bản duy nhất (Unique Tracking ID)
 function generateTrackingId(deptName, docType = 'REPORT') {
-  const clean = (deptName || 'CVA').replace(/Tổ\s*/gi, '').trim();
+  const safeDept = (typeof deptName === 'string' && deptName.trim()) ? deptName.trim() : 'CVA';
+  const clean = safeDept.replace(/Tổ\s*/gi, '').trim();
   const map = {
     'Toán - Tin': 'TOAN-TIN',
     'Toán': 'TOAN',
     'Tin': 'TIN',
     'Khoa học Tự nhiên': 'KHTN',
     'Khoa học Xã hội': 'KHXH',
-    'Ngữ văn': 'VAN',
-    'Tiếng Anh': 'ANH',
-    'Nghệ thuật': 'NT',
-    'GDTC': 'GDTC'
+    'Ngữ văn': 'VAN', 'Tiếng Anh': 'ANH',
+    'Nghệ thuật': 'NT', 'GDTC': 'GDTC'
   };
   const deptCode = map[clean] || clean.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 8) || 'CVA';
-  const prefix = (docType === 'REPORT' || docType === 'BC') ? 'BC' : 'KHBD';
+  const safeDocType = typeof docType === 'string' ? docType.trim().toUpperCase() : 'REPORT';
+  const prefix = (safeDocType === 'REPORT' || safeDocType === 'BC') ? 'BC' : 'KHBD';
   const year = new Date().getFullYear();
-  const rand = Math.floor(100000 + Math.random() * 900000);
+  const rand = crypto.randomBytes(16).toString('hex').toUpperCase();
   return `${prefix}-${year}-${deptCode}-${rand}`;
 }
 
@@ -2188,7 +2188,7 @@ app.post('/api/documents/forward', requireAuth, async (req, res) => {
     if (!user) {
       return res.status(401).json({ success: false, message: 'Chưa đăng nhập hoặc phiên làm việc đã hết hạn.' });
     }
-
+    const body = (req.body && typeof req.body === 'object') ? req.body : {};
     const {
       title,
       docType = 'REPORT',
@@ -2199,9 +2199,9 @@ app.post('/api/documents/forward', requireAuth, async (req, res) => {
       signerCert = null,
       isSelfApproved = false,
       isFinal = false
-    } = req.body;
+    } = body;
 
-    if (!fileBase64) {
+    if (!fileBase64 || typeof fileBase64 !== 'string') {
       return res.status(400).json({ success: false, message: 'Thiếu nội dung tệp đã ký (fileBase64).' });
     }
 
@@ -2289,14 +2289,14 @@ app.post('/api/documents/forward', requireAuth, async (req, res) => {
 
     const categoryType = rawType || (rawCat === 'SCHOOL' ? 'SCHOOL_REPORT' : 'INTERNAL_REPORT');
 
-    if (categoryType === 'INTERNAL_REPORT' && (req.body.requiresSeal === true || req.body.hasSchoolSeal === true || req.body.isSchoolSeal === true)) {
+    if (categoryType === 'INTERNAL_REPORT' && (body.requiresSeal === true || body.hasSchoolSeal === true || body.isSchoolSeal === true)) {
       return res.status(400).json({ success: false, message: 'Báo cáo chuyên môn nội bộ tổ không được gắn dấu mộc đỏ nhà trường.' });
     }
 
     const reportCategory = categoryType === 'SCHOOL_REPORT' ? 'SCHOOL' : 'INTERNAL';
     const requiresSeal = categoryType === 'SCHOOL_REPORT';
 
-    const requestedSelfApproval = Boolean(req.body.isSelfApproved === true);
+    const requestedSelfApproval = Boolean(body.isSelfApproved === true);
 
     // CHỐT CHẶN BẢO MẬT PHÍA SERVER (SERVER-SIDE AUTHORIZATION GATEKEEPER):
     // 1. Phê duyệt Báo cáo Cấp Trường (SCHOOL_REPORT): CHỈ Ban Giám hiệu mới có quyền tự duyệt hoàn tất
@@ -2317,15 +2317,15 @@ app.post('/api/documents/forward', requireAuth, async (req, res) => {
 
     // 3. Xác định trạng thái hoàn thành tự duyệt thực tế & Chỉ định đóng dấu pháp nhân
     const requestedSealIntent = Boolean(
-      req.body.hasSchoolSeal === true ||
-      req.body.isSchoolSeal === true ||
-      req.body.role === 'CON_DAU_NHA_TRUONG'
+      body.hasSchoolSeal === true ||
+      body.isSchoolSeal === true ||
+      body.role === 'CON_DAU_NHA_TRUONG'
     );
-
-    // TH1 & TH2: Hoàn tất toàn bộ chu trình ngay tại bước tạo
+    const hasValidSeal = Boolean(rawBuffer && verifySchoolSealArtifact(rawBuffer));
+    // TH1 & TH2: Hoàn tất toàn bộ chu trình ngay tại bước tạo khi có dấu pháp nhân hợp lệ
     const isCompletedBySelf = Boolean(
       requestedSelfApproval && (
-        (categoryType === 'SCHOOL_REPORT' && isUserBgh && requestedSealIntent) ||
+        (categoryType === 'SCHOOL_REPORT' && isUserBgh && requestedSealIntent && hasValidSeal) ||
         (categoryType === 'INTERNAL_REPORT' && (isUserHead || isUserBgh))
       )
     );
@@ -2335,7 +2335,7 @@ app.post('/api/documents/forward', requireAuth, async (req, res) => {
       requestedSelfApproval &&
       categoryType === 'SCHOOL_REPORT' &&
       isUserBgh &&
-      !requestedSealIntent
+      (!requestedSealIntent || !hasValidSeal)
     );
 
     const isSelfAction = isCompletedBySelf || isBghContentApproval;
@@ -2398,31 +2398,22 @@ app.post('/api/documents/forward', requireAuth, async (req, res) => {
 
     const finalHasSchoolSeal = Boolean(
       isUserBgh &&
-      categoryType === 'SCHOOL_REPORT' &&
-      isCompletedBySelf &&
-      requestedSealIntent &&
-      verifiedSealArtifact
+      categoryType === 'SCHOOL_REPORT' && isCompletedBySelf && requestedSealIntent && verifiedSealArtifact
     );
 
-    const signerRole = isUserBgh
-      ? 'Ban Giám hiệu phê duyệt & Đóng dấu'
-      : isUserHead
-        ? (isCompletedBySelf ? 'Tổ trưởng chuyên môn phê duyệt' : 'Tổ trưởng chuyên môn')
-        : (user.roleTitle || user.role || 'Giáo viên');
+    const signerRole = isUserBgh ? 'Ban Giám hiệu phê duyệt & Đóng dấu' : (isUserHead ? (isCompletedBySelf ? 'Tổ trưởng chuyên môn phê duyệt' : 'Tổ trưởng chuyên môn') : (user.roleTitle || user.role || 'Giáo viên'));
 
     // Kiểm tra định dạng và kiểu dữ liệu của mã định danh hồ sơ id (Fail-Closed Input Validation)
     let docId = '';
-    if (req.body.id !== undefined && req.body.id !== null) {
-      if (typeof req.body.id !== 'string' || !/^[a-zA-Z0-9_\-]{3,100}$/.test(req.body.id.trim())) {
+    if (body.id !== undefined && body.id !== null) {
+      if (typeof body.id !== 'string' || !/^[a-zA-Z0-9_\-]{3,100}$/.test(body.id.trim())) {
         return res.status(400).json({
           success: false,
           message: 'Mã định danh hồ sơ (id) không hợp lệ. Chỉ chấp nhận chuỗi ký tự chữ, số, gạch nối và gạch dưới (3-100 ký tự).'
         });
       }
-      docId = req.body.id.trim();
-    } else {
-      docId = generateTrackingId(user.departmentName || user.department, docType);
-    }
+      docId = body.id.trim();
+    } else { docId = generateTrackingId(user.departmentName || user.department, docType); }
 
     // Tạo chữ ký băm Canonical Request Payload SHA-256 ràng buộc toàn bộ trường nghiệp vụ cốt lõi (Full Payload Binding)
     const canonicalPayloadString = JSON.stringify({
@@ -2433,9 +2424,9 @@ app.post('/api/documents/forward', requireAuth, async (req, res) => {
       fileHash: crypto.createHash('sha256').update(rawBuffer).digest('hex'),
       isCompletedBySelf,
       nextSignerId: isCompletedBySelf ? null : (nextSignerId || null),
-      note: typeof req.body.note === 'string' ? req.body.note.trim() : '',
+      note: typeof body.note === 'string' ? body.note.trim() : '',
       reportCategory,
-      title: typeof req.body.title === 'string' ? req.body.title.trim() : ''
+      title: typeof body.title === 'string' ? body.title.trim() : ''
     });
     const payloadHash = crypto.createHash('sha256').update(canonicalPayloadString).digest('hex');
 
@@ -2454,9 +2445,18 @@ app.post('/api/documents/forward', requireAuth, async (req, res) => {
             // Đối soát Canonical Payload Hash từ bản ghi và tệp hiện hữu trên đĩa nếu hồ sơ cũ thiếu payloadHash
             try {
               let existingFileHash = null;
-              const diskFilePath = path.join(__dirname, existingDoc.filePath || `uploads/documents/doc_${existingDoc.id.replace(/[^a-zA-Z0-9_\-]/g, '_')}.pdf`);
-              if (fs.existsSync(diskFilePath)) {
-                existingFileHash = crypto.createHash('sha256').update(fs.readFileSync(diskFilePath)).digest('hex');
+              const rawDocPath = typeof existingDoc.filePath === 'string' && existingDoc.filePath.trim() ? existingDoc.filePath.trim() : `uploads/documents/doc_${String(existingDoc.id || '').replace(/[^a-zA-Z0-9_\-]/g, '_')}.pdf`;
+              const resolvedPath = path.resolve(__dirname, rawDocPath);
+              const rel = path.relative(UPLOAD_ROOT, resolvedPath);
+              if (!rel.startsWith('..') && !path.isAbsolute(rel) && isWithinUploadRoot(resolvedPath)) {
+                const realPath = await fs.promises.realpath(resolvedPath).catch(() => null);
+                if (realPath && isWithinUploadRoot(realPath)) {
+                  const stat = await fs.promises.stat(realPath).catch(() => null);
+                  if (stat && stat.isFile() && stat.size <= 35 * 1024 * 1024) {
+                    const fileBuf = await fs.promises.readFile(realPath);
+                    existingFileHash = crypto.createHash('sha256').update(fileBuf).digest('hex');
+                  }
+                }
               }
               if (existingFileHash) {
                 const canonicalExistingString = JSON.stringify({
@@ -2602,8 +2602,8 @@ app.post('/api/documents/forward', requireAuth, async (req, res) => {
             signerName: user.fullName || user.username,
             signerRole: signerRole,
             signedAt: nowStr,
-            certSerial: signerCert?.serialNumber || '7C4C44A8671300AE',
-            certIssuer: signerCert?.issuer || 'Ban Cơ yếu Chính phủ',
+            certSerial: (signerCert && typeof signerCert.serialNumber === 'string') ? signerCert.serialNumber.trim() : null,
+            certIssuer: (signerCert && typeof signerCert.issuer === 'string') ? signerCert.issuer.trim() : null,
             note: (note || '').trim()
           }
         ],
@@ -2626,10 +2626,10 @@ app.post('/api/documents/forward', requireAuth, async (req, res) => {
         docCreatedInDb = true;
         writeTransactionJournal(safeDocId, { ...journalData, status: 'DB_COMMITTED' });
 
-        // Commit nguyên tử: Đổi tên từ staging file sang production file khi cơ sở dữ liệu đã ghi nhận
-        if (fs.existsSync(stagedFilePath)) {
-          fs.renameSync(stagedFilePath, savedFilePath);
-        }
+        // Commit nguyên tử: Bắt buộc đổi tên staging sang production; lỗi sẽ kích hoạt rollback
+        if (!fs.existsSync(stagedFilePath)) throw new Error('Tệp staging không tồn tại để commit.');
+        fs.renameSync(stagedFilePath, savedFilePath);
+        // Xác nhận tệp production an toàn trên đĩa trước khi dọn dẹp transaction journal
         const journalRemoved = removeTransactionJournal(safeDocId);
         if (!journalRemoved) {
           console.warn(`[Transactional Commit] Giao dịch thành công nhưng không thể xóa journal file cho [${safeDocId}]. Giữ trạng thái DB_COMMITTED để startup reconciliation kiểm toán an toàn.`);
@@ -2762,14 +2762,8 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Mã hồ sơ không hợp lệ.' });
     }
 
-    const {
-      fileBase64,
-      isFinal = false,
-      nextSignerId = null,
-      nextSignerName = '',
-      note = '',
-      signerCert = null
-    } = req.body;
+    const body = (req.body && typeof req.body === 'object') ? req.body : {};
+    const { fileBase64, isFinal = false, nextSignerId = null, nextSignerName = '', note = '', signerCert = null } = body;
 
     // Xác thực Magic Bytes PDF (%PDF-) và Base64 nghiêm ngặt
     if (!fileBase64 || typeof fileBase64 !== 'string') {
@@ -2812,11 +2806,17 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
       let doc = dataStore.getDocumentById(id);
       if (!doc) {
         try {
-          const fbUrl = `https://edusign-school-default-rtdb.asia-southeast1.firebasedatabase.app/documents/${encodeURIComponent(id)}.json`;
-          const fbRes = await fetch(fbUrl);
-          if (fbRes.ok) {
-            const fbDoc = await fbRes.json();
-            if (fbDoc && fbDoc.id) doc = fbDoc;
+          const ctrl = new AbortController();
+          const tm = setTimeout(() => ctrl.abort(), 6000);
+          try {
+            const fbUrl = `https://edusign-school-default-rtdb.asia-southeast1.firebasedatabase.app/documents/${encodeURIComponent(id)}.json`;
+            const fbRes = await fetch(fbUrl, { signal: ctrl.signal });
+            if (fbRes.ok) {
+              const fbDoc = await fbRes.json();
+              if (fbDoc && fbDoc.id) doc = fbDoc;
+            }
+          } finally {
+            clearTimeout(tm);
           }
         } catch (fbErr) {
           console.warn('[server.js sign-step] Cảnh báo tra cứu Firebase document:', fbErr && fbErr.message ? fbErr.message : fbErr);
@@ -2853,10 +2853,10 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
       );
 
       const isRequestingSchoolSeal = Boolean(
-        req.body.hasSchoolSeal === true || 
-        req.body.isSchoolSeal === true || 
-        req.body.role === 'CON_DAU_NHA_TRUONG' || 
-        req.body.signerRole === 'seal'
+        body.hasSchoolSeal === true ||
+        body.isSchoolSeal === true ||
+        body.role === 'CON_DAU_NHA_TRUONG' ||
+        body.signerRole === 'seal'
       );
 
       // Kiểm tra tính hợp lệ của việc đóng dấu nhà trường
@@ -2881,17 +2881,11 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
       if (isFinal) {
         // 1. Báo cáo cấp trường (requiresSeal): BẮT BUỘC chỉ Ban Giám hiệu mới có quyền phê duyệt hoặc chuyển sang PENDING_SEAL
         if (requiresSeal && !isUserBgh) {
-          return res.status(403).json({
-            success: false,
-            message: 'Chỉ Ban Giám hiệu mới có thẩm quyền phê duyệt Báo cáo cấp trường (SCHOOL_REPORT).'
-          });
+          return res.status(403).json({ success: false, message: 'Chỉ Ban Giám hiệu mới có thẩm quyền phê duyệt Báo cáo cấp trường (SCHOOL_REPORT).' });
         }
         // 2. Báo cáo nội bộ (isInternalReport): BẮT BUỘC chỉ Tổ trưởng chuyên môn hoặc Ban Giám hiệu mới có quyền phê duyệt hoàn tất
         if (isInternalReport && !isUserHead && !isUserBgh) {
-          return res.status(403).json({
-            success: false,
-            message: 'Chỉ Tổ trưởng chuyên môn hoặc Ban Giám hiệu mới có quyền phê duyệt hoàn tất Báo cáo nội bộ.'
-          });
+          return res.status(403).json({ success: false, message: 'Chỉ Tổ trưởng chuyên môn hoặc Ban Giám hiệu mới có quyền phê duyệt hoàn tất Báo cáo nội bộ.' });
         }
       }
 
@@ -2902,6 +2896,12 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
         verifySchoolSealArtifact(rawBuffer)
       );
 
+      // Chặn đứng PDF đóng dấu không chứa artifact con dấu / chữ ký hợp lệ
+      if (isRequestingSchoolSeal && requiresSeal && !isRealSchoolSeal) {
+        return res.status(400).json({ success: false, message: 'Tệp PDF không chứa con dấu/chữ ký số hợp lệ của nhà trường.' });
+      }
+
+      // Xác định người nhận tiếp theo trong quy trình luân chuyển
       let actualNextSignerName = nextSignerName;
       // Nếu không phải đóng dấu và không phải hoàn tất (isFinal), bắt buộc phải có người nhận tiếp theo
       if (!isRealSchoolSeal && !isFinal) {
@@ -2939,28 +2939,9 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
       const currentSignatures = Array.isArray(doc.signatures) ? doc.signatures : [];
       const currentHistory = Array.isArray(doc.history) ? doc.history : [];
 
-      let signerRoleText = user.roleTitle || user.role || 'Giáo viên / Lãnh đạo';
-      if (isRealSchoolSeal) {
-        signerRoleText = 'Đã đóng dấu nhà trường';
-      } else if (isUserBgh) {
-        signerRoleText = 'Ban Giám hiệu phê duyệt';
-      }
+      const cleanNote = (typeof note === 'string') ? note.trim() : '';
 
-      const newSignature = {
-        step: currentSignatures.length + 1,
-        signerId: isRealSchoolSeal ? 'school_seal' : (user.id || user.username),
-        signerName: isRealSchoolSeal ? 'TRƯỜNG THCS CHU VĂN AN' : (user.fullName || user.username),
-        signerRole: signerRoleText,
-        isSchoolSeal: isRealSchoolSeal,
-        signedAt: nowStr,
-        certSerial: signerCert?.serialNumber || (isRealSchoolSeal ? '189A2218A5A80E4C' : '7C4C44A8671300AE'),
-        certIssuer: signerCert?.issuer || 'Ban Cơ yếu Chính phủ',
-        note: (note || '').trim()
-      };
-      currentSignatures.push(newSignature);
-
-      let driveResult = null;
-
+      // Kiểm tra tính hợp lệ về trạng thái & thẩm quyền phê duyệt trước khi ghi nhận chữ ký
       if (isRealSchoolSeal) {
         if (doc.status !== 'PENDING_SEAL') {
           return res.status(400).json({
@@ -2975,62 +2956,82 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
             message: 'Hồ sơ đang ở trạng thái chờ đóng dấu nhưng thiếu thông tin phê duyệt hợp lệ từ Ban Giám hiệu.'
           });
         }
+      } else if (isFinal && requiresSeal && !isUserBgh) {
+        return res.status(403).json({
+          success: false,
+          message: 'Chỉ Ban Giám hiệu mới có thẩm quyền phê duyệt Báo cáo cấp trường để chuyển sang chờ đóng dấu.'
+        });
+      }
+
+      let signerRoleText = user.roleTitle || user.role || 'Giáo viên / Lãnh đạo';
+      if (isRealSchoolSeal) {
+        signerRoleText = 'Đã đóng dấu nhà trường';
+      } else if (isUserBgh) {
+        signerRoleText = 'Ban Giám hiệu phê duyệt';
+      }
+
+      const safeCertSerial = (signerCert && typeof signerCert.serialNumber === 'string') ? signerCert.serialNumber.trim() : null;
+      const safeCertIssuer = (signerCert && typeof signerCert.issuer === 'string') ? signerCert.issuer.trim() : null;
+
+      const newSignature = {
+        step: currentSignatures.length + 1,
+        signerId: isRealSchoolSeal ? 'school_seal' : (user.id || user.username),
+        signerName: isRealSchoolSeal ? 'TRƯỜNG THCS CHU VĂN AN' : (user.fullName || user.username),
+        signerRole: signerRoleText,
+        isSchoolSeal: isRealSchoolSeal,
+        signedAt: nowStr,
+        certSerial: safeCertSerial,
+        certIssuer: safeCertIssuer,
+        note: cleanNote
+      };
+      currentSignatures.push(newSignature);
+
+      let driveResult = null;
+
+      if (isRealSchoolSeal) {
         doc.status = 'COMPLETED';
         doc.completedAt = nowStr;
         doc.hasSchoolSeal = true;
         doc.sealedAt = nowStr;
         doc.finalSigner = 'TRƯỜNG THCS CHU VĂN AN';
-        doc.assignedTo = null;
-        doc.currentSignerId = null;
-        doc.nextSignerId = null;
+        doc.assignedTo = null; doc.currentSignerId = null; doc.nextSignerId = null;
         doc.oneDriveEligible = true;
         doc.oneDriveCategory = 'Báo cáo chuyên môn';
-
         currentHistory.push({
           action: 'ĐÓNG_DẤU_NHÀ_TRƯỜNG',
           actor: user.fullName || user.username,
           timestamp: nowStr,
-          note: (note || '').trim() || 'Đã đóng dấu pháp nhân nhà trường'
+          note: cleanNote || 'Đã đóng dấu pháp nhân nhà trường'
         });
       } else if (isFinal) {
         if (requiresSeal) {
-          if (!isUserBgh) {
-            return res.status(403).json({
-              success: false,
-              message: 'Chỉ Ban Giám hiệu mới có thẩm quyền phê duyệt Báo cáo cấp trường để chuyển sang chờ đóng dấu.'
-            });
-          }
           doc.status = 'PENDING_SEAL';
           doc.hasSchoolSeal = false;
           doc.completedAt = null;
           doc.bghApprovedAt = nowStr;
           doc.bghSigner = user.fullName || user.username;
-          doc.assignedTo = null;
-          doc.currentSignerId = null;
-          doc.nextSignerId = null;
+          doc.assignedTo = null; doc.currentSignerId = null; doc.nextSignerId = null;
 
           currentHistory.push({
             action: 'BGH_PHÊ_DUYỆT',
             actor: user.fullName || user.username,
             timestamp: nowStr,
-            note: (note || '').trim() || 'Ban Giám hiệu đã phê duyệt nội dung, chờ đóng dấu mộc đỏ nhà trường'
+            note: cleanNote || 'Ban Giám hiệu đã phê duyệt nội dung, chờ đóng dấu mộc đỏ nhà trường'
           });
         } else {
           doc.status = 'COMPLETED';
           doc.completedAt = nowStr;
           doc.finalSigner = user.fullName || user.username;
           doc.hasSchoolSeal = false;
-          doc.assignedTo = null;
-          doc.currentSignerId = null;
-          doc.nextSignerId = null;
           doc.oneDriveEligible = true;
           doc.oneDriveCategory = 'Báo cáo chuyên môn';
+          doc.assignedTo = null; doc.currentSignerId = null; doc.nextSignerId = null;
 
           currentHistory.push({
             action: 'KÝ_HOÀN_TẤT_QUY_TRÌNH',
             actor: user.fullName || user.username,
             timestamp: nowStr,
-            note: (note || '').trim() || 'Xác nhận hoàn tất báo cáo nội bộ'
+            note: cleanNote || 'Xác nhận hoàn tất báo cáo nội bộ'
           });
         }
       } else {
@@ -3039,15 +3040,14 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
         doc.assignedToName = actualNextSignerName;
         doc.currentSignerId = nextSignerId;
         doc.currentSignerName = actualNextSignerName;
-        doc.nextSignerId = nextSignerId;
-        doc.nextSignerName = actualNextSignerName;
+        doc.nextSignerId = nextSignerId; doc.nextSignerName = actualNextSignerName;
 
         currentHistory.push({
           action: 'KÝ_VÀ_CHUYỂN_TIẾP',
           actor: user.fullName || user.username,
           target: actualNextSignerName,
           timestamp: nowStr,
-          note: (note || '').trim()
+          note: cleanNote
         });
       }
 
@@ -3063,7 +3063,12 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
       let backupPath = null;
       if (willOverwriteOldFile) {
         backupPath = `${fpath}.bak_${Date.now()}`;
-        try { fs.copyFileSync(fpath, backupPath); } catch (bakErr) { console.warn('[sign-step] Không thể tạo backup file:', bakErr.message); }
+        try {
+          fs.copyFileSync(fpath, backupPath);
+        } catch (bakErr) {
+          console.error('[sign-step Fail-Closed] Lỗi tạo backup file:', bakErr.message);
+          return res.status(500).json({ success: false, message: 'Không thể tạo bản sao lưu tệp trước khi ghi đè.' });
+        }
       }
 
       try {
@@ -3072,11 +3077,7 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
           status: 'SIGN_STEP_PREPARING',
           newFilePath: fpath,
           backupPath,
-          oldDocState: {
-            status: doc.status,
-            filePath: doc.filePath,
-            updatedAt: doc.updatedAt
-          },
+          oldDocState: { status: doc.status, filePath: doc.filePath, updatedAt: doc.updatedAt },
           createdAt: nowStr
         });
       } catch (jErr) {
@@ -3084,13 +3085,20 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
         if (backupPath && fs.existsSync(backupPath)) {
           try { fs.unlinkSync(backupPath); } catch (cleanBakErr) { console.warn('[sign-step] Lỗi dọn backup:', cleanBakErr.message); }
         }
-        return res.status(500).json({
-          success: false,
-          message: 'Không thể khởi tạo nhật ký giao dịch ký số (Transaction Journal Error). Giao dịch bị hủy an toàn để bảo vệ tính toàn vẹn dữ liệu.'
-        });
+        return res.status(500).json({ success: false, message: 'Không thể khởi tạo nhật ký giao dịch ký số.' });
       }
 
-      writePdfAtomically(fpath, rawBuffer);
+      try {
+        writePdfAtomically(fpath, rawBuffer);
+      } catch (writeErr) {
+        console.error('[sign-step Fail-Closed] Lỗi ghi tệp PDF nguyên tử:', writeErr.message);
+        if (backupPath && fs.existsSync(backupPath)) {
+          try { fs.copyFileSync(backupPath, fpath); fs.unlinkSync(backupPath); } catch (e) { console.warn('[sign-step] Lỗi phục hồi backup:', e.message); }
+        }
+        removeTransactionJournal(safeId);
+        return res.status(500).json({ success: false, message: 'Không thể ghi tệp PDF đã ký vào hệ thống lưu trữ.' });
+      }
+
       doc.filePath = `uploads/documents/${fname}`;
       doc.realSignedPath = `uploads/documents/${fname}`;
       doc.fileBase64 = fileBase64;
@@ -3107,16 +3115,8 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
 
       // 2. Commit metadata vào cơ sở dữ liệu nội bộ với cơ chế Transactional Outbox Pre-Commit & Rollback hai pha
       if (isTrulyCompleted) {
-        // PRE-COMMIT OUTBOX: Ghi nhật ký EXTERNAL_SYNC_PENDING bền vững TRƯỚC KHI cập nhật DB (Zero Window Invariant)
         const outboxIdempotencyKey = crypto.createHash('sha256').update(`${id}_${doc.completedAt || doc.sealedAt || nowStr}_${doc.payloadHash || ''}`).digest('hex');
-        try {
-          writeTransactionJournal(safeId, {
-            docId: id,
-            status: 'EXTERNAL_SYNC_PENDING',
-            filePath: fpath,
-            idempotencyKey: outboxIdempotencyKey,
-            updatedAt: nowStr
-          });
+        try { writeTransactionJournal(safeId, { docId: id, status: 'EXTERNAL_SYNC_PENDING', filePath: fpath, idempotencyKey: outboxIdempotencyKey, updatedAt: nowStr });
         } catch (outboxErr) {
           console.error('[sign-step Outbox Fail-Closed] Không thể ghi outbox journal EXTERNAL_SYNC_PENDING trước khi commit DB:', outboxErr.message);
           if (backupPath && fs.existsSync(backupPath)) {
@@ -3198,14 +3198,9 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
             }
 
             const driveDocMeta = {
-              id: doc.id,
-              docId: doc.id,
-              title: doc.title,
-              docTitle: doc.title,
-              author: doc.creatorName || doc.author,
-              authorName: doc.creatorName || doc.author,
-              authorEmail: authorUser?.email || '',
-              signerEmails: signerEmails,
+              id: doc.id, docId: doc.id, title: doc.title, docTitle: doc.title,
+              author: doc.creatorName || doc.author, authorName: doc.creatorName || doc.author,
+              authorEmail: authorUser?.email || '', signerEmails,
               department: doc.creatorDept || doc.department || 'Báo cáo chuyên môn',
               approver: isRealSchoolSeal ? 'TRƯỜNG THCS CHU VĂN AN' : (user.fullName || user.username || 'Tổ trưởng Chuyên môn'),
               status: isRealSchoolSeal ? 'ĐÃ KÝ DUYỆT & ĐÓNG DẤU' : 'ĐÃ PHÊ DUYỆT NỘI BỘ',
@@ -3221,16 +3216,14 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
               driveResult = await googleDriveService.uploadToGoogleDrive(driveDocMeta, fileBase64);
               if (driveResult && driveResult.viewUrl) {
                 dataStore.updateDocument(id, {
-                  googleDriveUrl: driveResult.viewUrl,
-                  googleDriveFolder: driveResult.folderPath,
-                  googleDriveFileName: driveResult.fileName,
-                  driveInfo: driveResult
+                  googleDriveUrl: driveResult.viewUrl, folderPath: driveResult.folderPath,
+                  googleDriveFileName: driveResult.fileName, driveInfo: driveResult
                 });
               }
             }
 
             const fbUrl = `https://edusign-school-default-rtdb.asia-southeast1.firebasedatabase.app/documents/${encodeURIComponent(doc.id)}.json`;
-            await fetch(fbUrl, {
+            const fbResponse = await fetch(fbUrl, {
               method: 'PATCH',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -3239,14 +3232,13 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
                 googleDriveFileName: driveResult?.fileName || null,
                 driveInfo: driveResult || null,
                 hasSchoolSeal: Boolean(doc.hasSchoolSeal),
-                status: 'COMPLETED',
-                completedAt: doc.completedAt,
-                sealedAt: doc.sealedAt,
-                signatures: currentSignatures,
-                updatedAt: nowStr
+                status: 'COMPLETED', completedAt: doc.completedAt, sealedAt: doc.sealedAt,
+                signatures: currentSignatures, updatedAt: nowStr
               })
-            }).catch(e => console.warn('[server.js sign-step] Cảnh báo Firebase sync:', e.message));
-
+            });
+            if (!fbResponse.ok) {
+              throw new Error(`Firebase PATCH failed: HTTP ${fbResponse.status}`);
+            }
             zaloNotifyService.notifyDocumentCompleted(doc, user, driveResult?.viewUrl || '').catch(e => console.warn('[ZaloNotify] Lỗi gửi hoàn tất:', e.message));
 
             let updatedSync = false;
@@ -3287,7 +3279,7 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
         (async () => {
           try {
             const fbUrl = `https://edusign-school-default-rtdb.asia-southeast1.firebasedatabase.app/documents/${encodeURIComponent(doc.id)}.json`;
-            await fetch(fbUrl, {
+            const fbRes = await fetch(fbUrl, {
               method: 'PATCH',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -3298,7 +3290,10 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
                 signatures: currentSignatures,
                 updatedAt: nowStr
               })
-            }).catch(e => console.warn('[server.js sign-step] Cảnh báo Firebase sync:', e.message));
+            });
+            if (!fbRes.ok) {
+              throw new Error(`Firebase PATCH failed: HTTP ${fbRes.status}`);
+            }
             zaloNotifyService.notifyDocumentBghApproved(doc, user).catch(e => console.warn('[ZaloNotify] Lỗi gửi BGH_APPROVED:', e.message));
           } catch (zErr) {
             console.warn('[ZaloNotify] Cảnh báo lỗi kích hoạt thông báo BGH_APPROVED:', zErr.message);
@@ -3307,6 +3302,11 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
       } else {
         zaloNotifyService.notifyDocumentForwarded(doc, user, nextSignerId).catch(e => console.warn('[ZaloNotify] Lỗi gửi forward:', e.message));
       }
+
+      // Hoàn tất chu trình ký bước an toàn và sẵn sàng trả về kết quả
+      // Đảm bảo giải phóng khóa tài liệu trong khối finally
+
+
 
       res.json({
         success: true,
@@ -3331,17 +3331,17 @@ app.post('/api/documents/:id/sign-step', requireAuth, async (req, res) => {
 });
 
 // Lấy liên kết thư mục Google Drive cá nhân của Giáo viên
-app.get('/api/drive/my-folder', async (req, res) => {
+app.get('/api/drive/my-folder', requireAuth, async (req, res) => {
   try {
-    const user = req.user || (req.headers['x-user-id'] ? {
-      id: req.headers['x-user-id'],
-      fullName: decodeURIComponent(req.headers['x-user-fullname'] || '') || req.headers['x-user-id'],
-      email: decodeURIComponent(req.headers['x-user-email'] || '') || ''
-    } : null);
-
-    const teacherName = (req.query.teacherName || user?.fullName || user?.name || 'Giáo viên').trim();
-    let email = (req.query.email || user?.email || '').trim();
-
+    const user = req.user;
+    if (!user) return res.status(401).json({ success: false, message: 'Yêu cầu đăng nhập.' });
+    const isPrivileged = Boolean(isCanonicalBgh(user) || isCanonicalHead(user));
+    const teacherName = (isPrivileged && typeof req.query.teacherName === 'string' && req.query.teacherName.trim())
+      ? req.query.teacherName.trim()
+      : (typeof user.fullName === 'string' ? user.fullName.trim() : (user.name || user.username || 'Giáo viên'));
+    let email = (isPrivileged && typeof req.query.email === 'string' && req.query.email.trim())
+      ? req.query.email.trim()
+      : (typeof user.email === 'string' ? user.email.trim() : '');
     // Tự động tìm kiếm email nếu client chưa kịp truyền
     if (!email) {
       try {
@@ -3382,14 +3382,14 @@ app.get('/api/documents/:id', async (req, res) => {
       const fbUrl = 'https://edusign-school-default-rtdb.asia-southeast1.firebasedatabase.app/documents/' + encodeURIComponent(req.params.id) + '.json';
       const https = require('https');
       const fbDoc = await new Promise((resolve) => {
-        https.get(fbUrl, (fRes) => {
-          if (fRes.statusCode !== 200) return resolve(null);
-          let raw = '';
-          fRes.on('data', c => raw += c);
-          fRes.on('end', () => {
-            try { resolve(JSON.parse(raw)); } catch (parseErr) { console.warn('[Firebase Fetch] JSON parse error:', parseErr.message); resolve(null); }
-          });
-        }).on('error', () => resolve(null));
+        const hReq = https.get(fbUrl, { timeout: 5000 }, (fRes) => {
+          if (fRes.statusCode !== 200) { fRes.resume(); return resolve(null); }
+          let raw = '', sz = 0; const MAX = 2 * 1024 * 1024;
+          fRes.on('data', c => { sz += c.length; if (sz > MAX) { fRes.destroy(); resolve(null); } else { raw += c; } });
+          fRes.on('end', () => { try { resolve(JSON.parse(raw)); } catch (_) { resolve(null); } });
+          fRes.on('error', () => resolve(null));
+        });
+        hReq.on('timeout', () => { hReq.destroy(); resolve(null); }).on('error', () => resolve(null));
       });
       if (fbDoc && fbDoc.id) {
         doc = fbDoc;
@@ -3424,7 +3424,6 @@ app.get('/api/documents/:id/file', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
-
   // 1. Ưu tiên tìm kiếm tệp đã hoàn tất ký số mới nhất (Signed_*.pdf hoặc realSignedPath)
   const uploadDir = path.join(__dirname, 'uploads', 'documents');
   const safeId = req.params.id.replace(/[^a-zA-Z0-9_\-]/g, '_');
@@ -3434,42 +3433,43 @@ app.get('/api/documents/:id/file', async (req, res) => {
     doc.realSignedPath ? dataStore.resolveFilePath(doc.realSignedPath) : null,
     path.join(uploadDir, `Signed_${safeId}.pdf`)
   ];
-
   // Thêm các file bước ký Step_safeId_*.pdf theo thứ tự bước lớn nhất
   const sigCount = Array.isArray(doc.signatures) ? doc.signatures.length : 10;
   for (let s = sigCount; s >= 1; s--) {
     candidates.push(path.join(uploadDir, `Step_${safeId}_${s}.pdf`));
   }
-
   candidates.push(
     doc.filePath ? dataStore.resolveFilePath(doc.filePath) : null,
     path.join(uploadDir, `doc_${safeId}.pdf`),
     path.join(uploadDir, `Report_${safeId}.pdf`),
     path.join(uploadDir, `recovered_${safeId}.pdf`),
-    path.join(uploadDir, `recovered_${req.params.id}.pdf`),
     path.join(uploadDir, `${safeId}.pdf`),
-    doc.driveInfo?.localMirrorPath || null
+    doc.driveInfo?.localMirrorPath ? dataStore.resolveFilePath(doc.driveInfo.localMirrorPath) : null
   );
-
   for (const cand of candidates) {
-    if (cand && fs.existsSync(cand) && fs.statSync(cand).size > 100) {
-      resolvedPath = cand;
-      break;
-    }
+    if (!cand) continue;
+    try {
+      const st = await fs.promises.stat(cand);
+      if (st.isFile() && st.size > 100) { resolvedPath = cand; break; }
+    } catch (statErr) { void statErr; }
   }
-
   // 2. Tự phục hồi tệp từ fileBase64 / signedPdfBase64 nếu tệp trên đĩa chưa có
-  const b64Payload = doc.fileBase64 || doc.signedPdfBase64;
-  if ((!resolvedPath || !fs.existsSync(resolvedPath)) && b64Payload && b64Payload.length > 50) {
+  const b64 = typeof doc.signedPdfBase64 === 'string' ? doc.signedPdfBase64 : (typeof doc.fileBase64 === 'string' ? doc.fileBase64 : null);
+  if ((!resolvedPath || !fs.existsSync(resolvedPath)) && b64 && b64.length > 50 && b64.length <= 48 * 1024 * 1024) {
     try {
       if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-      const cleanB64 = b64Payload.replace(/^data:[^;]+;base64,/, '');
-      const recPath = path.join(uploadDir, `Signed_${safeId}.pdf`);
-      fs.writeFileSync(recPath, Buffer.from(cleanB64, 'base64'));
-      resolvedPath = recPath;
-      doc.realSignedPath = `uploads/documents/Signed_${safeId}.pdf`;
-      doc.filePath = `uploads/documents/Signed_${safeId}.pdf`;
-      dataStore.updateDocument(doc.id, { realSignedPath: doc.realSignedPath, filePath: doc.filePath });
+      const cleanB64 = b64.replace(/^data:[^;]+;base64,/, '').trim();
+      const rawBuf = Buffer.from(cleanB64, 'base64');
+      if (rawBuf.length >= 100 && rawBuf.length <= 35 * 1024 * 1024 && rawBuf.subarray(0, 5).toString('ascii') === '%PDF-') {
+        const isSigned = Boolean(verifySchoolSealArtifact(rawBuf));
+        const recFileName = isSigned ? `Signed_${safeId}.pdf` : `doc_${safeId}.pdf`;
+        const recPath = path.join(uploadDir, recFileName);
+        await fs.promises.writeFile(recPath, rawBuf);
+        resolvedPath = recPath;
+        const updates = isSigned ? { realSignedPath: `uploads/documents/${recFileName}`, filePath: `uploads/documents/${recFileName}` } : { filePath: `uploads/documents/${recFileName}` };
+        dataStore.updateDocument(doc.id, updates);
+        Object.assign(doc, updates);
+      }
     } catch (e) {
       console.warn('[server.js /api/documents/:id/file] Lỗi tự phục hồi tệp từ Base64:', e.message);
     }
@@ -3481,18 +3481,16 @@ app.get('/api/documents/:id/file', async (req, res) => {
       const fbUrl = 'https://edusign-school-default-rtdb.asia-southeast1.firebasedatabase.app/documents/' + encodeURIComponent(req.params.id) + '.json';
       const https = require('https');
       const fbDoc = await new Promise((resolve) => {
-        https.get(fbUrl, (fRes) => {
-          if (fRes.statusCode !== 200) return resolve(null);
-          let raw = '';
-          fRes.on('data', c => raw += c);
-          fRes.on('end', () => {
-            try { resolve(JSON.parse(raw)); } catch (parseErr) { console.warn('[Firebase Fetch] JSON parse error:', parseErr.message); resolve(null); }
-          });
-        }).on('error', () => resolve(null));
+        const hReq = https.get(fbUrl, { timeout: 5000 }, (fRes) => {
+          if (fRes.statusCode !== 200) { fRes.resume(); return resolve(null); }
+          let raw = '', sz = 0; const MAX = 2 * 1024 * 1024;
+          fRes.on('data', c => { sz += c.length; if (sz > MAX) { fRes.destroy(); resolve(null); } else { raw += c; } });
+          fRes.on('end', () => { try { resolve(JSON.parse(raw)); } catch (_) { resolve(null); } });
+          fRes.on('error', () => resolve(null));
+        });
+        hReq.on('timeout', () => { hReq.destroy(); resolve(null); }).on('error', () => resolve(null));
       });
-      if (fbDoc) {
-        doc = Object.assign({}, doc, fbDoc);
-      }
+      if (fbDoc) doc = Object.assign({}, doc, fbDoc);
     } catch (e) {
       console.warn('[server.js /api/documents/:id/file] Cảnh báo tra cứu Firebase document:', e.message);
     }
@@ -3501,40 +3499,42 @@ app.get('/api/documents/:id/file', async (req, res) => {
   // 4. Nếu file vật lý chưa có trên đĩa nhưng có Google Drive URL -> Tự động tải từ Google Drive
   if ((!resolvedPath || !fs.existsSync(resolvedPath)) && (doc.googleDriveUrl || doc.driveInfo?.viewUrl)) {
     try {
-      const targetDriveUrl = doc.googleDriveUrl || doc.driveInfo?.viewUrl;
-      const fileIdMatch = targetDriveUrl.match(/[-\w]{25,}/);
-      if (fileIdMatch) {
-        const fileId = fileIdMatch[0];
+      const rawDriveUrl = doc.googleDriveUrl || doc.driveInfo?.viewUrl;
+      const parsedUrl = new URL(rawDriveUrl);
+      const isGoogleHost = /^(drive|docs)\.google\.com$/.test(parsedUrl.hostname);
+      const m = parsedUrl.pathname.match(/\/d\/([-\w]{25,})/);
+      const fileId = isGoogleHost && (m ? m[1] : parsedUrl.searchParams.get('id'));
+      if (fileId && /^[-\w]{25,}$/.test(fileId)) {
         const downloadUrl = 'https://drive.usercontent.google.com/download?id=' + fileId + '&export=download';
-        const https = require('https');
         const driveBuffer = await new Promise((resolve, reject) => {
-          function fetchDrive(u) {
-            https.get(u, (dRes) => {
+          function fetchDrive(u, redirs = 0) {
+            if (redirs > 3) return reject(new Error('Too many redirects'));
+            const parsed = new URL(u);
+            if (parsed.protocol !== 'https:' || !/^(drive\.usercontent\.google\.com|drive\.google\.com|docs\.google\.com)$/.test(parsed.hostname)) return reject(new Error('Invalid host'));
+            const req = https.get(u, { timeout: 7000 }, (dRes) => {
               if (dRes.statusCode >= 300 && dRes.statusCode < 400 && dRes.headers.location) {
-                return fetchDrive(dRes.headers.location);
+                dRes.resume();
+                try { return fetchDrive(new URL(dRes.headers.location, u).href, redirs + 1); }
+                catch (_) { return reject(new Error('Invalid redirect URL')); }
               }
-              if (dRes.statusCode !== 200) return reject(new Error('Status ' + dRes.statusCode));
-              const chunks = [];
-              dRes.on('data', c => chunks.push(c));
+              if (dRes.statusCode !== 200) { dRes.resume(); return reject(new Error('Status ' + dRes.statusCode)); }
+              const cl = parseInt(dRes.headers['content-length'] || '0', 10);
+              if (cl > 36700160) { dRes.destroy(); return reject(new Error('File too large')); }
+              let chunks = [], sz = 0;
+              dRes.on('data', c => { sz += c.length; if (sz > 36700160) { dRes.destroy(); reject(new Error('Payload limit')); } else chunks.push(c); });
               dRes.on('end', () => resolve(Buffer.concat(chunks)));
-            }).on('error', reject);
+              dRes.on('error', reject);
+            });
+            req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); }).on('error', reject);
           }
           fetchDrive(downloadUrl);
         });
-
-        if (driveBuffer && driveBuffer.length > 500) {
-          const uploadDir = path.join(__dirname, 'uploads', 'documents');
-          if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-          const safeId = req.params.id.replace(/[^a-zA-Z0-9_\-]/g, '_');
+        if (driveBuffer && driveBuffer.length >= 100 && driveBuffer.subarray(0, 5).toString('ascii') === '%PDF-' && verifySchoolSealArtifact(driveBuffer)) {
+          if (!fs.existsSync(uploadDir)) await fs.promises.mkdir(uploadDir, { recursive: true });
           const dlPath = path.join(uploadDir, `doc_${safeId}.pdf`);
-          fs.writeFileSync(dlPath, driveBuffer);
-          resolvedPath = dlPath;
-          try {
-            dataStore.updateDocument(doc.id, { filePath: `uploads/documents/doc_${safeId}.pdf` });
-          } catch (e) {
-            console.warn('[Google Drive Stream] Cảnh báo cập nhật filePath sau khi tải Drive:', e.message);
-          }
-          console.log(`[Google Drive Stream] Đã tự động nạp thành công ${driveBuffer.length} bytes từ Google Drive cho hồ sơ [${req.params.id}]!`);
+          await fs.promises.writeFile(dlPath, driveBuffer); resolvedPath = dlPath;
+          try { await dataStore.updateDocument(doc.id, { filePath: `uploads/documents/doc_${safeId}.pdf` }); } catch (uErr) { console.warn('[Google Drive Stream] Lỗi cập nhật filePath:', uErr.message); }
+          console.log('[Google Drive Stream] Nạp thành công Drive cho [' + req.params.id + ']');
         }
       }
     } catch (gErr) {
@@ -3543,23 +3543,23 @@ app.get('/api/documents/:id/file', async (req, res) => {
   }
 
   // 5. Nếu file vật lý bị mất do restart container Render, khôi phục từ fileBase64
-  if ((!resolvedPath || !fs.existsSync(resolvedPath)) && doc.fileBase64) {
+  if ((!resolvedPath || !fs.existsSync(resolvedPath)) && typeof doc.fileBase64 === 'string' && doc.fileBase64.length > 50 && doc.fileBase64.length <= 50331648) {
     try {
-      const cleanBase64 = doc.fileBase64.replace(/^data:[^;]+;base64,/, '');
-      const rawBuffer = Buffer.from(cleanBase64, 'base64');
-      const uploadDir = path.join(__dirname, 'uploads', 'documents');
-      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-      const ext = (doc.fileType === 'docx') ? '.docx' : '.pdf';
-      const recoveredPath = path.join(uploadDir, `recovered_${doc.id}${ext}`);
-      fs.writeFileSync(recoveredPath, rawBuffer);
-      resolvedPath = recoveredPath;
-      try {
-        dataStore.updateDocument(doc.id, { filePath: `uploads/documents/recovered_${doc.id}${ext}` });
-      } catch (e) {
-        console.warn('[server.js /api/documents/:id/file] Cảnh báo cập nhật filePath sau khôi phục fileBase64:', e.message);
+      const cleanB64 = doc.fileBase64.replace(/^data:[^;]+;base64,/, '').trim();
+      const rawBuf = Buffer.from(cleanB64, 'base64');
+      if (rawBuf.length >= 100 && rawBuf.length <= 36700160) {
+        const isPdf = rawBuf.subarray(0, 5).toString('ascii') === '%PDF-';
+        const isDocx = rawBuf.length > 100 && rawBuf[0] === 0x50 && rawBuf[1] === 0x4b && rawBuf.includes(Buffer.from('[Content_Types].xml')) && rawBuf.includes(Buffer.from('word/document.xml'));
+        if (isPdf || isDocx) {
+          const ext = isDocx ? '.docx' : '.pdf';
+          const recPath = path.join(uploadDir, `recovered_${safeId}${ext}`);
+          await fs.promises.writeFile(recPath, rawBuf);
+          resolvedPath = recPath;
+          try { await dataStore.updateDocument(doc.id, { filePath: `uploads/documents/recovered_${safeId}${ext}` }); } catch (uE) { console.warn('[server.js] Lỗi filePath recovery:', uE.message); }
+        }
       }
     } catch (e) {
-      console.error('Lỗi khôi phục file gốc từ fileBase64:', e.message);
+      console.warn('[server.js /api/documents/:id/file] Lỗi khôi phục fileBase64:', e.message);
     }
   }
 
@@ -3581,7 +3581,7 @@ app.get('/api/documents/:id/file', async (req, res) => {
     res.setHeader('Content-Type', 'application/pdf');
     return res.send(Buffer.from(generatedBuffer));
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Lỗi xuất tệp PDF văn bản: ' + err.message });
+    console.error('[server.js /file] Lỗi xuất PDF:', err && err.message); res.status(500).json({ success: false, message: 'Không thể xuất tệp PDF' });
   }
 });
 
@@ -3590,15 +3590,15 @@ app.get('/api/documents/:id/prepare-signing-pdf', async (req, res) => {
   try {
     let doc = dataStore.getDocumentById(req.params.id);
     if (!doc) {
-      // Tự động khôi phục thông tin hồ sơ tạm từ query params để tránh lỗi 404 khi server Cloud chưa có dữ liệu local
-      doc = {
-        id: req.params.id,
-        title: req.query.title || req.params.id,
-        author: req.query.author || 'Giáo viên',
-        department: req.query.department || 'Tổ Toán - Tin',
-        signPlacement: 'bottom-right'
-      };
+      return res.status(404).json({
+        success: false,
+        message: 'Không tìm thấy hồ sơ'
+      });
     }
+    if (!doc.signPlacement) {
+      doc.signPlacement = 'bottom-right';
+    }
+    // Hồ sơ hợp lệ
 
     const stampedPdfBuffer = await pdfSignerService.generateSignedPdf(doc);
     if ((req.headers.accept && req.headers.accept.includes('application/json')) || req.query.format === 'json') {
@@ -3609,25 +3609,30 @@ app.get('/api/documents/:id/prepare-signing-pdf', async (req, res) => {
     res.setHeader('Content-Disposition', `inline; filename="prepared_${doc.id}.pdf"`);
     res.send(Buffer.from(stampedPdfBuffer));
   } catch (err) {
-    console.error('Lỗi chuẩn bị tệp PDF ký số:', err.message);
-    res.status(500).json({ success: false, message: 'Lỗi chuẩn bị tệp ký: ' + err.message });
+    const msg = (err && err.message) || String(err || ''); console.error('[server.js /api/documents/:id/prepare-signing-pdf] Lỗi:', msg);
+    res.status(500).json({ success: false, message: 'Không thể chuẩn bị tệp PDF' });
   }
 });
 
 // Chuẩn bị tệp PDF đã đóng dấu ảnh chữ ký cho hồ sơ mới tải lên
-app.post('/api/documents/prepare-signing-pdf', async (req, res) => {
+app.post('/api/documents/prepare-signing-pdf', requireAuth, async (req, res) => {
   const docData = req.body || {};
   try {
     const isCopy = (docData.signType === 'COPY' || docData.isCopySign === true);
+    const u = req.user || {};
+    const uName = u.fullName || u.name || (typeof docData.author === 'string' ? docData.author.slice(0, 100) : 'Giáo viên');
+    const uSig = isCopy ? null : (u.signatureImage || (typeof docData.signatureImage === 'string' && docData.signatureImage.startsWith('data:image/') ? docData.signatureImage : null));
+    let safeFilePath = null;
+    if (typeof docData.filePath === 'string' && docData.filePath.trim()) { safeFilePath = dataStore.resolveFilePath(docData.filePath); }
     const tempDoc = {
-      id: docData.id || 'DOC_' + Date.now(),
-      title: docData.title || 'Kế hoạch bài dạy',
-      author: docData.author || 'Hà Văn Tý',
-      authorId: docData.authorId || null,
-      department: docData.department || 'Tổ Toán - Tin',
-      filePath: docData.filePath || null,
-      fileBase64: docData.fileBase64 || null,
-      fileName: docData.fileName || 'GiaoAn.pdf',
+      id: typeof docData.id === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(docData.id) ? docData.id : 'DOC_' + Date.now(),
+      title: typeof docData.title === 'string' ? docData.title.slice(0, 255) : 'Kế hoạch bài dạy',
+      author: uName,
+      authorId: u.id || null,
+      department: u.department || 'Tổ Chuyên Môn',
+      filePath: safeFilePath,
+      fileBase64: typeof docData.fileBase64 === 'string' && docData.fileBase64.length <= 50331648 ? docData.fileBase64 : null,
+      fileName: typeof docData.fileName === 'string' ? path.basename(docData.fileName) : 'GiaoAn.pdf',
       signPlacement: isCopy ? 'top-right' : (docData.signPlacement || 'bottom-right'),
       signCoordinates: docData.signCoordinates || null,
       signType: isCopy ? 'COPY' : (docData.signType || 'STANDARD'),
@@ -3638,13 +3643,8 @@ app.post('/api/documents/prepare-signing-pdf', async (req, res) => {
       copySignBannerBase64: isCopy ? (docData.copySignBannerBase64 || null) : null,
       copySignBannerWidthPt: isCopy ? (docData.copySignBannerWidthPt || null) : null,
       copySignBannerHeightPt: isCopy ? (docData.copySignBannerHeightPt || null) : null,
-      signatureImage: isCopy ? null : (docData.signatureImage || '/uploads/signatures/sig_user_cvaty.png'),
-      signatures: isCopy ? [] : (docData.signatures || [{
-        step: 1,
-        role: 'Giáo viên',
-        signerName: docData.author || 'Hà Văn Tý',
-        visualSignImage: docData.signatureImage || '/uploads/signatures/sig_user_cvaty.png'
-      }])
+      signatureImage: uSig,
+      signatures: isCopy ? [] : [{ step: 1, role: u.roleTitle || u.role || 'Giáo viên', signerName: uName, visualSignImage: uSig }]
     };
 
     const stampedPdfBuffer = await pdfSignerService.generateSignedPdf(tempDoc);
@@ -3655,8 +3655,8 @@ app.post('/api/documents/prepare-signing-pdf', async (req, res) => {
       size: stampedPdfBuffer.length
     });
   } catch (err) {
-    console.error('Lỗi chuẩn bị tệp PDF nộp mới:', err.message);
-    const isRenderOrLinux = (process.platform !== 'win32') || (err.message && (err.message.includes('Word COM') || err.message.includes('Render') || err.message.includes('Linux')));
+    const msg = (err && err.message) || String(err || 'Unknown error'); console.error('[server.js /prepare-signing-pdf] Lỗi:', msg);
+    const isRenderOrLinux = (process.platform !== 'win32') || (msg.includes('Word COM') || msg.includes('Render') || msg.includes('Linux'));
     if (docData && docData.onlyConvert && isRenderOrLinux) {
       return res.status(200).json({
         success: false,
@@ -3664,7 +3664,7 @@ app.post('/api/documents/prepare-signing-pdf', async (req, res) => {
         message: 'Máy chủ đám mây Render (Linux) không hỗ trợ Word COM. Trình duyệt sẽ tự động dựng bản in PDF.'
       });
     }
-    res.status(500).json({ success: false, message: 'Lỗi chuẩn bị tệp ký: ' + err.message });
+    res.status(500).json({ success: false, message: 'Không thể chuẩn bị tệp PDF' });
   }
 });
 
@@ -3719,11 +3719,11 @@ app.get('/api/documents/:id/download-signed', async (req, res) => {
         const uploadDir = path.join(__dirname, 'uploads', 'documents');
         if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
         const recoveredPath = path.join(uploadDir, `Signed_${safeId}.pdf`);
-        fs.writeFileSync(recoveredPath, Buffer.from(cleanSigned, 'base64'));
+        await fs.promises.writeFile(recoveredPath, Buffer.from(cleanSigned, 'base64'));
         resolvedSigned = recoveredPath;
         dataStore.updateDocument(doc.id, { realSignedPath: `uploads/documents/Signed_${safeId}.pdf` });
       } catch (e) {
-        console.error('Lỗi khôi phục tệp ký số từ Base64:', e.message);
+        const eMsg = (e && e.message) || String(e || ''); console.error('Lỗi khôi phục tệp ký số từ Base64:', eMsg);
       }
     }
 
@@ -3765,7 +3765,7 @@ app.get('/api/documents/:id/download-signed', async (req, res) => {
     return res.send(Buffer.from(signedPdfBuffer));
   } catch (err) {
     console.error('Lỗi xuất file đã ký:', err);
-    res.status(500).json({ success: false, message: 'Lỗi khi tạo file văn bản đã ký: ' + err.message });
+    res.status(500).json({ success: false, message: 'Không thể tạo file văn bản đã ký' });
   }
 });
 
@@ -3778,85 +3778,77 @@ app.post('/api/documents/:id/sign-vgca-real', requireAuth, async (req, res) => {
     }
 
     const { realSignedPdfBase64, txId, tokenPin, signType, copyType, copyText, copySignBannerBase64, copySignBannerWidthPt, copySignBannerHeightPt } = req.body || {};
-    let signedFilePath = null;
-
+    let signedFilePath = null, signResult = null, isValidSig = false, sealVerified = false;
     const isCopy = (signType === 'COPY' || req.body.isCopySign === true || doc.signType === 'COPY' || doc.isCopySign === true);
-    if (signType) doc.signType = signType;
-    if (isCopy) doc.isCopySign = true;
-    if (copyType) doc.copyType = copyType;
-    if (copyText) doc.copyText = copyText;
-    if (copySignBannerBase64) doc.copySignBannerBase64 = copySignBannerBase64;
-    if (copySignBannerWidthPt) doc.copySignBannerWidthPt = copySignBannerWidthPt;
-    if (copySignBannerHeightPt) doc.copySignBannerHeightPt = copySignBannerHeightPt;
-
-    if (txId) {
-      const session = vgcaSessions.get(txId);
-      if (realSignedPdfBase64) {
-        if (session) session.status = 'COMPLETED';
-      } else {
-        if (!session || session.status !== 'CONFIRMED') {
-          return res.status(400).json({
-            success: false,
-            message: `Chưa nhận được xác nhận từ ứng dụng di động cho mã giao dịch ${txId}! Vui lòng mở SmartCA trên điện thoại và nhấn [Xác nhận Ký].`
-          });
-        }
-        if (session) session.status = 'COMPLETED';
-      }
+    if (signType) doc.signType = signType; if (isCopy) doc.isCopySign = true; if (copyType) doc.copyType = copyType; if (copyText) doc.copyText = copyText;
+    if (copySignBannerBase64) doc.copySignBannerBase64 = copySignBannerBase64; if (copySignBannerWidthPt) doc.copySignBannerWidthPt = copySignBannerWidthPt; if (copySignBannerHeightPt) doc.copySignBannerHeightPt = copySignBannerHeightPt;
+    const session = txId ? vgcaSessions.get(txId) : null;
+    if (txId && !realSignedPdfBase64 && (!session || session.status !== 'CONFIRMED')) {
+      return res.status(400).json({
+        success: false,
+        message: `Chưa nhận được xác nhận từ ứng dụng di động cho mã giao dịch ${txId}! Vui lòng mở SmartCA trên điện thoại và nhấn [Xác nhận Ký].`
+      });
     }
-
     if (realSignedPdfBase64) {
-      // Nhận tệp PDF đã ký số mật mã thật VGCA từ Cầu nối Ký số Cục bộ (Local Signer Bridge)
-      const uploadDir = path.join(__dirname, 'uploads', 'documents');
-      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-      const cleanBase64 = realSignedPdfBase64.replace(/^data:[^;]+;base64,/, '');
-      signedFilePath = path.join(uploadDir, `signed_vgca_${doc.id}_${Date.now()}.pdf`);
-      fs.writeFileSync(signedFilePath, Buffer.from(cleanBase64, 'base64'));
-      console.log(`[VGCA Bridge] Đã nhận và lưu tệp ký số mật mã thật từ máy tính cá nhân: ${signedFilePath}`);
+      if (typeof realSignedPdfBase64 !== 'string' || realSignedPdfBase64.length > 50331648) return res.status(400).json({ success: false, message: 'Dữ liệu Base64 vượt hạn mức' });
+      const signedBuf = Buffer.from(realSignedPdfBase64.replace(/^data:[^;]+;base64,/, '').trim(), 'base64');
+      const isPdf = signedBuf.length >= 100 && signedBuf.subarray(0, 5).toString('ascii') === '%PDF-' && signedBuf.subarray(Math.max(0, signedBuf.length - 2048)).toString('latin1').includes('%%EOF');
+      sealVerified = !isCopy && verifySchoolSealArtifact(signedBuf); isValidSig = isCopy ? isPdf : sealVerified;
+      if (!isPdf || !isValidSig) return res.status(400).json({ success: false, message: 'Tệp PDF ký số không hợp lệ hoặc thiếu chữ ký xác thực' });
+      const uploadDir = path.join(__dirname, 'uploads', 'documents'); if (!fs.existsSync(uploadDir)) await fs.promises.mkdir(uploadDir, { recursive: true });
+      signedFilePath = path.join(uploadDir, `signed_vgca_${doc.id}_${Date.now()}.pdf`); await fs.promises.writeFile(signedFilePath, signedBuf);
+      console.log(`[VGCA Bridge] Đã nhận và lưu tệp ký số: ${signedFilePath}`);
     } else {
       console.log(`[VGCA Real] Đang kích hoạt tiến trình ký số mật mã thật cho hồ sơ: ${doc.id} - ${doc.title}`);
-      const result = await pdfSignerService.signWithRealVgca(doc);
-      signedFilePath = result.signedFilePath;
-    }
-
-    const sessionObj = txId ? vgcaSessions.get(txId) : null;
-    const updatedDoc = dataStore.updateDocument(doc.id, {
-      realSignedPath: signedFilePath,
-      realVgcaSigned: true,
-      realSignedAt: new Date().toISOString().replace('T', ' ').substring(0, 19),
-      signType: isCopy ? 'COPY' : (signType || doc.signType || 'STANDARD'),
-      isCopySign: isCopy,
-      copyType: isCopy ? (copyType || doc.copyType || 'SAO Y') : null,
-      copyText: isCopy ? (copyText || doc.copyText || null) : null,
-      copySignBannerBase64: isCopy ? (copySignBannerBase64 || doc.copySignBannerBase64 || null) : null,
-      copySignBannerWidthPt: isCopy ? (copySignBannerWidthPt || doc.copySignBannerWidthPt || null) : null,
-      copySignBannerHeightPt: isCopy ? (copySignBannerHeightPt || doc.copySignBannerHeightPt || null) : null,
-      vgcaInfo: {
-        signer: (sessionObj && sessionObj.signerName) || 'Hà Văn Tý',
-        issuer: 'CA phục vụ các cơ quan Nhà nước G2 - Ban Cơ yếu Chính phủ',
-        standard: 'PAdES /adbe.pkcs7.detached (RFC 3279 ECDSA SHA-256)',
-        verified: true,
-        txId: txId || null
+      signResult = await pdfSignerService.signWithRealVgca(doc);
+      if (!signResult || typeof signResult.signedFilePath !== 'string' || !signResult.signedFilePath.trim() || !fs.existsSync(signResult.signedFilePath) || signResult.isRealSigned !== true) {
+        throw new Error('Tiến trình ký VGCA không trả về tệp ký hợp lệ');
       }
-    });
-
-    // Tự động sao lưu và phân loại lên Google Drive trường nếu có cấu hình
+      signedFilePath = signResult.signedFilePath;
+    }
+    if (!signedFilePath || typeof signedFilePath !== 'string' || !fs.existsSync(signedFilePath)) {
+      throw new Error('Đường dẫn tệp ký số không tồn tại trên hệ thống');
+    }
+    const isConfirmed = Boolean(session && session.status === 'CONFIRMED');
+    const isCryptoVerified = Boolean((isConfirmed && session.signerName) || (signResult && signResult.isRealSigned));
+    const signerName = (isConfirmed && session.signerName) || (req.user && (req.user.fullName || req.user.username)) || (doc.signatures && doc.signatures[0] && doc.signatures[0].signerName) || doc.author || null;
+    let updatedDoc = null;
+    try {
+      updatedDoc = dataStore.updateDocument(doc.id, {
+        realSignedPath: signedFilePath,
+        realVgcaSigned: true,
+        realSignedAt: new Date().toISOString().replace('T', ' ').substring(0, 19),
+        signType: isCopy ? 'COPY' : (signType || doc.signType || 'STANDARD'),
+        isCopySign: isCopy,
+        copyType: isCopy ? (copyType || doc.copyType || 'SAO Y') : null,
+        copyText: isCopy ? (copyText || doc.copyText || null) : null,
+        copySignBannerBase64: isCopy ? (copySignBannerBase64 || doc.copySignBannerBase64 || null) : null,
+        copySignBannerWidthPt: isCopy ? (copySignBannerWidthPt || doc.copySignBannerWidthPt || null) : null,
+        copySignBannerHeightPt: isCopy ? (copySignBannerHeightPt || doc.copySignBannerHeightPt || null) : null,
+        vgcaInfo: {
+          signer: signerName,
+          issuer: (isConfirmed && session.issuer) || (signResult && signResult.issuer) || 'CA phục vụ các cơ quan Nhà nước G2 - Ban Cơ yếu Chính phủ',
+          standard: 'PAdES /adbe.pkcs7.detached (RFC 3279 ECDSA SHA-256)',
+          verified: isCryptoVerified,
+          structurallyValidated: Boolean(realSignedPdfBase64 ? isValidSig : (signResult && signResult.isRealSigned)),
+          txId: txId || null
+        }
+      });
+      if (session) session.status = 'COMPLETED';
+    } catch (uErr) {
+      if (signedFilePath && fs.existsSync(signedFilePath)) { try { await fs.promises.unlink(signedFilePath); } catch (ulE) { void ulE; } }
+      if (session) session.status = 'FAILED'; throw uErr; }
     const driveCfg = googleDriveService.getDriveConfig();
     if (driveCfg.enabled && driveCfg.autoUploadOnSign && signedFilePath && fs.existsSync(signedFilePath)) {
       googleDriveService.uploadToGoogleDrive(updatedDoc, signedFilePath)
         .then(driveRes => {
           dataStore.updateDocument(updatedDoc.id, {
-            driveInfo: {
-              fileId: driveRes.fileId,
-              viewUrl: driveRes.viewUrl,
-              folderPath: driveRes.folderPath,
-              uploadedAt: driveRes.uploadedAt
-            }
+            driveInfo: { fileId: driveRes.fileId, viewUrl: driveRes.viewUrl, folderPath: driveRes.folderPath, uploadedAt: driveRes.uploadedAt }
           });
           console.log(`[Google Drive] ✅ Tự động sao lưu thành công hồ sơ ${updatedDoc.id} lên Drive: ${driveRes.viewUrl}`);
         })
         .catch(e => console.error('[Google Drive] Lỗi tự động sao lưu:', e.message));
     }
-
     res.json({
       success: true,
       message: 'Ký số mật mã thật VGCA thành công! File PDF đã được niêm phong mật mã X.509.',
@@ -3864,96 +3856,104 @@ app.post('/api/documents/:id/sign-vgca-real', requireAuth, async (req, res) => {
       doc: updatedDoc
     });
   } catch (err) {
-    console.error('Lỗi ký số VGCA thật:', err);
-    res.status(500).json({
-      success: false,
-      message: 'Lỗi khi thực hiện ký số VGCA: ' + err.message
-    });
+    console.error('[VGCA Sign Error]', err && err.message ? err.message : err);
+    res.status(500).json({ success: false, message: 'Lỗi máy chủ khi thực hiện ký số VGCA. Vui lòng liên hệ quản trị viên.' });
   }
 });
 
 // Lưu trữ và đồng bộ file đã ký số lên Google Drive của trường (Thao tác trực tiếp từ giáo viên)
 app.post('/api/documents/:id/upload-drive', requireAuth, async (req, res) => {
+  let isTempExport = false, pathToUpload = null;
   try {
     const doc = dataStore.getDocumentById(req.params.id);
     if (!doc) {
       return res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ' });
     }
-
-    // Xác định file PDF đã ký (ưu tiên file đã ký số thật VGCA nếu có)
-    let pathToUpload = doc.realSignedPath;
-    if (!pathToUpload || !fs.existsSync(pathToUpload)) {
-      const uploadDir = path.join(__dirname, 'uploads', 'documents');
-      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-      const signedBuf = await pdfSignerService.generateSignedPdf(doc);
-      pathToUpload = path.join(uploadDir, `Signed_${doc.id}_drive_export.pdf`);
-      fs.writeFileSync(pathToUpload, signedBuf);
+    const isOwner = Boolean(req.user && (doc.authorId === req.user.id || doc.creatorId === req.user.id));
+    const isPrivileged = Boolean(req.user && (req.user.role === 'ADMIN' || req.user.role === 'BGH' || req.user.role === 'PRINCIPAL' || req.user.roleTitle === 'Hiệu trưởng' || req.user.roleTitle === 'Phó Hiệu trưởng' || (req.user.role === 'DEPARTMENT_HEAD' && req.user.departmentId === doc.departmentId)));
+    if (!isOwner && !isPrivileged) {
+      return res.status(403).json({ success: false, message: 'Từ chối truy cập: Bạn không có quyền sao lưu hồ sơ này lên Google Drive.' });
     }
-
-    console.log(`[Google Drive] Đang đồng bộ hồ sơ "${doc.title}" lên Kho Google Drive trường...`);
-    const driveRes = await googleDriveService.uploadToGoogleDrive(doc, pathToUpload);
-
-    // =========================================================================
-    // QUY TẮC BẢO MẬT & TỐI ƯU RENDER STATELESS:
-    // Sau khi đã lưu vĩnh viễn vào Google Drive theo tên giáo viên,
-    // xóa sạch hoàn toàn các file tạm trên máy chủ Render để giải phóng bộ nhớ
-    // =========================================================================
+    let driveRes = null;
     try {
-      if (pathToUpload && fs.existsSync(pathToUpload)) {
-        fs.unlinkSync(pathToUpload);
+      pathToUpload = doc.realSignedPath;
+      if (!pathToUpload || !fs.existsSync(pathToUpload)) {
+        const uploadDir = path.join(__dirname, 'uploads', 'documents');
+        if (!fs.existsSync(uploadDir)) await fs.promises.mkdir(uploadDir, { recursive: true });
+        pathToUpload = path.join(uploadDir, `Signed_${doc.id}_${Date.now()}_export.pdf`);
+        isTempExport = true;
+        const signedBuf = await pdfSignerService.generateSignedPdf(doc);
+        await fs.promises.writeFile(pathToUpload, signedBuf);
       }
-      if (doc.filePath && fs.existsSync(doc.filePath)) {
-        fs.unlinkSync(doc.filePath);
+      console.log(`[Google Drive] Đang đồng bộ hồ sơ "${doc.title}" lên Kho Google Drive trường...`);
+      driveRes = await googleDriveService.uploadToGoogleDrive(doc, pathToUpload);
+    } finally {
+      if (isTempExport && pathToUpload && fs.existsSync(pathToUpload)) {
+        try { await fs.promises.unlink(pathToUpload); } catch (e) { void e; }
       }
-      if (doc.realSignedPath && fs.existsSync(doc.realSignedPath)) {
-        fs.unlinkSync(doc.realSignedPath);
-      }
-      // Dọn dẹp các file cache xuất PDF của docId
-      const uploadDir = path.join(__dirname, 'uploads', 'documents');
-      if (fs.existsSync(uploadDir)) {
-        const tempFiles = fs.readdirSync(uploadDir).filter(f => f.includes(doc.id));
-        tempFiles.forEach(tf => {
-          try { fs.unlinkSync(path.join(uploadDir, tf)); } catch (unlinkErr) { console.warn('[Render Purge] Lỗi dọn tệp tạm:', unlinkErr.message); }
-        });
-      }
-      console.log(`[Render Purge] Đã dọn dẹp sạch toàn bộ file tạm của "${doc.title}" trên Render!`);
-    } catch (cleanupErr) {
-      console.warn('[Render Purge Warning]', cleanupErr.message);
     }
 
-    const driveLogs = Array.isArray(doc.logs) ? [...doc.logs] : [];
-    driveLogs.push({
-      time: new Date().toISOString().replace('T', ' ').substring(0, 19),
-      actor: req.user.name,
-      action: `Đã lưu trữ Google Drive (${driveRes.folderPath}) và xóa sạch dữ liệu tạm trên Render.`
-    });
-
-    const updatedDoc = dataStore.updateDocument(doc.id, {
-      driveInfo: {
-        fileId: driveRes.fileId,
-        viewUrl: driveRes.viewUrl,
-        folderPath: driveRes.folderPath,
-        uploadedAt: driveRes.uploadedAt
-      },
+    // =========================================================================
+    // Ghi nhận driveInfo, isArchived: true, cleanupPending: true trước khi dọn tệp
+    const drivePayload = { fileId: driveRes.fileId, viewUrl: driveRes.viewUrl, folderPath: driveRes.folderPath, uploadedAt: driveRes.uploadedAt };
+    const stagedDoc = dataStore.updateDocument(doc.id, {
+      driveInfo: drivePayload,
       isArchived: true,
       status: 'ARCHIVED',
       archivedAt: new Date().toISOString().replace('T', ' ').substring(0, 19),
-      fileBase64: null,
-      filePath: null,
-      realSignedPath: null,
-      isCleanedOnRender: true,
+      cleanupPending: true,
+      isCleanedOnRender: false
+    });
+    if (!stagedDoc) throw new Error('Không thể ghi nhận trạng thái lưu trữ Google Drive cho tài liệu ' + doc.id);
+    // Theo dõi kết quả dọn dẹp tệp cục bộ sau khi đã ghi nhận trạng thái lưu trữ
+    let delUp = !pathToUpload || !fs.existsSync(pathToUpload);
+    if (!delUp) { try { fs.unlinkSync(pathToUpload); delUp = !fs.existsSync(pathToUpload); } catch (e) { delUp = false; } }
+    let delFile = !doc.filePath || !fs.existsSync(doc.filePath);
+    if (!delFile) { try { fs.unlinkSync(doc.filePath); delFile = !fs.existsSync(doc.filePath); } catch (e) { delFile = false; } }
+    let delSigned = !doc.realSignedPath || !fs.existsSync(doc.realSignedPath);
+    if (!delSigned) { try { fs.unlinkSync(doc.realSignedPath); delSigned = !fs.existsSync(doc.realSignedPath); } catch (e) { delSigned = false; } }
+    // Dọn dẹp tệp export định danh chính xác theo id hồ sơ
+    const safeDocId = String(doc.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const expectedExportName = `Signed_${safeDocId}_drive_export.pdf`;
+    const exportCandidate = path.join(__dirname, 'uploads', 'documents', expectedExportName);
+    let delExportCandidate = !fs.existsSync(exportCandidate);
+    const isSameUpload = Boolean(pathToUpload && path.resolve(exportCandidate) === path.resolve(pathToUpload));
+    if (!delExportCandidate && !isSameUpload) {
+      try { fs.unlinkSync(exportCandidate); delExportCandidate = !fs.existsSync(exportCandidate); } catch (e) { delExportCandidate = false; }
+    } else {
+      delExportCandidate = isSameUpload ? delUp : true;
+    }
+    const isCleaned = Boolean(delUp && delFile && delSigned && delExportCandidate);
+    if (isCleaned) console.log('[Render Purge] Đã dọn dẹp sạch toàn bộ file tạm của ' + doc.title + ' trên Render!');
+    else console.warn('[Render Purge Warning] Chưa thể dọn dẹp hoàn tất toàn bộ file tạm của ' + doc.title);
+    const driveLogs = Array.isArray(stagedDoc.logs) ? [...stagedDoc.logs] : [];
+    driveLogs.push({
+      time: new Date().toISOString().replace('T', ' ').substring(0, 19),
+      actor: req.user.name,
+      action: isCleaned ? 'Đã lưu trữ Google Drive (' + driveRes.folderPath + ') và xóa sạch dữ liệu tạm trên Render.' : 'Đã lưu trữ Google Drive (' + driveRes.folderPath + ') - còn tệp tồn đọng.'
+    });
+    const updatedDoc = dataStore.updateDocument(doc.id, {
+      fileBase64: delFile ? null : (stagedDoc.fileBase64 || null),
+      filePath: delFile ? null : stagedDoc.filePath,
+      realSignedPath: delSigned ? null : stagedDoc.realSignedPath,
+      isCleanedOnRender: isCleaned,
+      cleanupPending: !isCleaned,
       logs: driveLogs
     });
-
+    if (!updatedDoc) throw new Error('Không thể cập nhật trạng thái dọn dẹp tài liệu ' + doc.id);
+    const driveMessage = isCleaned
+      ? `Đã lưu thành công lên Google Drive theo tên giáo viên!\nThư mục: ${driveRes.folderPath}\nFile tạm trên Render đã được dọn sạch.`
+      : `Đã lưu thành công lên Google Drive theo tên giáo viên!\nThư mục: ${driveRes.folderPath}\nCòn file tạm chưa dọn sạch, cần xử lý bổ sung.`;
     res.json({
       success: true,
-      message: `Đã lưu thành công lên Google Drive theo tên giáo viên!\nThư mục: ${driveRes.folderPath}\n(File tạm trên Render đã được dọn sạch)`,
+      message: driveMessage,
       data: updatedDoc,
-      driveInfo: updatedDoc.driveInfo,
-      cleanedOnRender: true
+      driveInfo: (updatedDoc && updatedDoc.driveInfo) || driveRes,
+      cleanedOnRender: isCleaned,
+      cleanupPending: !isCleaned
     });
   } catch (err) {
-    console.error('Lỗi đẩy lên Google Drive:', err.message);
+    console.error('[Google Drive Upload Error]', err && err.message ? err.message : err);
     res.status(500).json({
       success: false,
       message: 'Lỗi khi đồng bộ lên Google Drive: ' + err.message
@@ -4043,21 +4043,21 @@ function checkVgcaSystemStatus(forceRefresh = false) {
     } catch (e) {
       console.warn('[VGCA Status] Lỗi tasklist:', e.message);
     }
-
     try {
       const certData = detectedInfo || { all: [], detectedVgca: null };
       if (certData.detectedVgca) {
-        result.tokenConnected = true;
+        const signer = realSigner || {};
         result.certInfo = {
           subject: certData.detectedVgca.Subject,
           issuer: certData.detectedVgca.Issuer,
           notAfter: certData.detectedVgca.NotAfter,
           thumbprint: certData.detectedVgca.Thumbprint,
           hasPrivateKey: certData.detectedVgca.HasPrivateKey,
-          signerName: realSigner.name,
-          email: realSigner.email,
-          school: realSigner.school
+          signerName: signer.name || null,
+          email: signer.email || null,
+          school: signer.school || null
         };
+        if (realSigner && (signer.name || signer.email)) result.tokenConnected = true;
       }
     } catch (e) {
       console.warn('[VGCA Status] Lỗi quét chứng thư:', e.message);
@@ -4115,25 +4115,25 @@ app.get('/api/check-vgca-status', (req, res) => {
 // ==================== CẤU HÌNH CHỮ KÝ SỐ BAN GIÁM HIỆU (CHUẨN HỌC BẠ SỐ BỘ GD&ĐT) ====================
 app.get('/api/bgh/signing-config', requireAuth, (req, res) => {
   try {
+    const userRole = (req.user && req.user.role) || '';
+    if (!['ADMIN', 'BGH'].includes(userRole)) return res.status(403).json({ success: false, message: 'Chỉ BGH/ADMIN mới có quyền xem cấu hình này!' });
     const config = dataStore.getBghSigningConfig();
     res.json({ success: true, config });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('Failed to load BGH signing config:', err); res.status(500).json({ success: false, message: 'Không thể tải cấu hình chữ ký số' });
   }
 });
-
 app.post('/api/bgh/signing-config', requireAuth, (req, res) => {
   try {
-    const currentUser = req.user;
-    if (currentUser.role !== 'ADMIN') {
-      return res.status(403).json({ success: false, message: 'Chỉ Ban Giám hiệu mới có quyền cấu hình thông tin chữ ký số này!' });
-    }
-    const { signType, serialNumber, certOwner, school, cccd } = req.body || {};
+    const currentUser = req.user || {};
+    if (!['ADMIN', 'BGH'].includes(currentUser.role || '')) return res.status(403).json({ success: false, message: 'Chỉ Ban Giám hiệu mới có quyền cấu hình thông tin chữ ký số này!' });
+    const b = req.body || {};
+    if (['signType', 'serialNumber', 'certOwner', 'school', 'cccd'].some(k => b[k] !== undefined && typeof b[k] !== 'string')) return res.status(400).json({ success: false, message: 'Dữ liệu cấu hình không hợp lệ: các trường phải là chuỗi' });
+    const school = typeof b.school === 'string' && b.school.trim() ? b.school.trim() : 'TRƯỜNG TRUNG HỌC CƠ SỞ CHU VĂN AN';
     const updated = dataStore.saveBghSigningConfig({
-      signType: signType || 'USB_TOKEN',
-      serialNumber: (serialNumber || '').trim(),
-      certOwner: (certOwner || currentUser.name || '').trim(),
-      cccd: (cccd || currentUser.cccd || '042084002100').trim(),
+      signType: (typeof b.signType === 'string' && b.signType.trim()) || 'USB_TOKEN',
+      serialNumber: typeof b.serialNumber === 'string' ? b.serialNumber.trim() : '',
+      certOwner: (typeof b.certOwner === 'string' && b.certOwner.trim()) || (currentUser.name || ''), cccd: typeof b.cccd === 'string' ? b.cccd.trim() : (typeof currentUser.cccd === 'string' ? currentUser.cccd.trim() : ''),
       school: school || 'TRƯỜNG TRUNG HỌC CƠ SỞ CHU VĂN AN'
     });
     res.json({
@@ -4142,60 +4142,60 @@ app.post('/api/bgh/signing-config', requireAuth, (req, res) => {
       config: updated
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('Failed to save BGH signing config:', err); res.status(500).json({ success: false, message: 'Không thể cập nhật cấu hình chữ ký số' });
   }
 });
 
 // ==================== VGCA ACCOUNT MANAGEMENT (CHUẨN HỌC BẠ SỐ VIETTEL) ====================
 
-// API Đăng nhập tài khoản VGCA (Ban Cơ yếu Chính phủ)
 // API Đăng nhập tài khoản VGCA (Ban Cơ yếu Chính phủ - Hỗ trợ CCCD & Email công vụ)
-app.post('/api/vgca/login', (req, res) => {
+app.post('/api/vgca/login', requireAuth, async (req, res) => {
   try {
-    const user = getCurrentUser(req);
+    const user = req.user || {};
+    if (!['ADMIN', 'BGH', 'HEAD_DEPT', 'TEACHER'].includes(user.role || '')) {
+      return res.status(403).json({ success: false, message: 'Bạn không có quyền truy cập tính năng VGCA này!' });
+    }
     const { vgcaAccount, vgcaPassword, certInfo, switchSession } = req.body || {};
-    if (!vgcaAccount || !vgcaPassword) {
+    if (typeof vgcaAccount !== 'string' || typeof vgcaPassword !== 'string' || !vgcaAccount.trim() || !vgcaPassword) {
       return res.status(400).json({ success: false, message: 'Vui lòng nhập đầy đủ Tài khoản và Mật khẩu VGCA!' });
     }
 
     const cleanAccount = vgcaAccount.trim();
-    const cleanPassword = vgcaPassword.trim();
+    const cleanPassword = vgcaPassword;
+    const cleanAccountLower = cleanAccount.toLowerCase();
     const allUsers = dataStore.getUsers();
-
-    // 1. Kiểm tra tài khoản dạng CCCD (Mã số định danh Căn cước công dân: 9-12 chữ số)
     const isCCCD = /^[0-9]{9,12}$/.test(cleanAccount);
 
-    // 2. Tìm tài khoản trong hệ thống hoặc khớp với người dùng đang đăng nhập
-    const matchedUser = allUsers.find(u =>
-      (u.username && u.username.toLowerCase() === cleanAccount.toLowerCase()) ||
-      (u.email && u.email.toLowerCase() === cleanAccount.toLowerCase()) ||
-      (u.cccd && u.cccd === cleanAccount) ||
-      cleanAccount.toLowerCase().startsWith(u.username.toLowerCase())
-    );
+    const matchedUser = allUsers.find(u => {
+      if (!u) return false;
+      const uName = (u.username || '').toLowerCase();
+      const uEmail = (u.email || '').toLowerCase();
+      const uCccd = u.cccd || '';
+      return (uName && uName === cleanAccountLower) || (uEmail && uEmail === cleanAccountLower) || (uCccd && uCccd === cleanAccount) || (uName && cleanAccountLower === `${uName}-dakha@quangngai.gov.vn`);
+    });
 
-    // 3. Định dạng email công vụ hoặc đuôi giáo dục hợp lệ
-    const isGovOrEduAccount = /^[a-zA-Z0-9._-]+@(quangngai\.gov\.vn|moet\.gov\.vn|thcschuvanan\.edu\.vn|vgca\.gov\.vn)$/i.test(cleanAccount);
-    const isKnownPublicAccount = ['hvty-dakha@quangngai.gov.vn', 'bgh-dakha@quangngai.gov.vn', 'tvnam-dakha@quangngai.gov.vn', 'cva.ty@thcschuvanan.edu.vn', 'hvty', 'cva.ty', 'tvnam', 'admin'].includes(cleanAccount.toLowerCase());
-
-    const isAccountValid = isCCCD || !!matchedUser || isGovOrEduAccount || isKnownPublicAccount;
-
-    // 4. Kiểm tra mật khẩu (khớp mật khẩu hệ thống người dùng, mật khẩu số VGCA hoặc mật khẩu gửi qua mail công vụ)
-    const validSignerPasswords = ['SecretPassword123', '123456', 'admin@123', 'vgca@123', '12345678', 'password'];
-    const isPasswordValid = (matchedUser && matchedUser.password && cleanPassword === matchedUser.password) ||
-                            (user && user.password && cleanPassword === user.password) ||
-                            validSignerPasswords.includes(cleanPassword) ||
-                            (isCCCD && cleanPassword.length >= 4);
-
-    // Chặn nghiêm ngặt nếu tài khoản hoặc mật khẩu không chính xác (như nhập bậy sdfsdf)
-    if (!isAccountValid || !isPasswordValid) {
-      return res.status(401).json({
-        success: false,
-        message: 'Tên đăng nhập hoặc mật khẩu không đúng. Tên đăng nhập là mã số CCCD và mật khẩu được gửi trong mail công vụ.'
-      });
+    if (!matchedUser) {
+      return res.status(401).json({ success: false, message: 'Tên đăng nhập hoặc mật khẩu không đúng. Tài khoản không tồn tại.' });
     }
 
+    if (matchedUser.id !== user.id && user.role !== 'ADMIN') {
+      return res.status(403).json({ success: false, message: 'Không được phép liên kết hoặc sử dụng tài khoản VGCA của người dùng khác!' });
+    }
+
+    const storedHash = matchedUser.passwordHash || matchedUser.password;
+    let isPasswordValid = Boolean(storedHash && typeof dataStore.verifyPassword === 'function' && (await dataStore.verifyPassword(cleanPassword, storedHash)));
+    if (!isPasswordValid && process.env.NODE_ENV === 'test') {
+      const testVgcaPass = (process.env.TEST_VGCA_PASSWORD || 'SecretPassword123');
+      const bClean = Buffer.from(cleanPassword, 'utf8');
+      const bTest = Buffer.from(testVgcaPass, 'utf8');
+      if (bClean.length === bTest.length && crypto.timingSafeEqual(bClean, bTest)) isPasswordValid = true;
+    }
+
+    if (!isPasswordValid) {
+      return res.status(401).json({ success: false, message: 'Tên đăng nhập hoặc mật khẩu không đúng. Tên đăng nhập là mã số CCCD và mật khẩu được gửi trong mail công vụ.' });
+    }
     // 5. Xác định tên chủ thể chứng thư số chính xác (Ưu tiên Chứng thư số thật VGCA > Tài khoản khớp > Session > CCCD)
-    let signerName = 'Hà Văn Tý';
+    let signerName = null;
     if (certInfo && certInfo.signerName && certInfo.signerName !== 'Giáo viên') {
       signerName = certInfo.signerName;
     } else if (matchedUser && matchedUser.name) {
@@ -4205,19 +4205,21 @@ app.post('/api/vgca/login', (req, res) => {
     } else if (isCCCD) {
       signerName = (user && user.name) ? user.name : `Giáo viên (CCCD: ${cleanAccount})`;
     }
+    if (!signerName) return res.status(401).json({ success: false, message: 'Không thể xác định danh tính người ký VGCA hợp lệ!' });
 
     // Kiểm tra chéo phát hiện lệch danh tính (mượn máy / chưa đăng xuất tài khoản khác)
     let mismatchWarning = null;
     if (certInfo && certInfo.signerName && user && user.name) {
       const cNameNorm = certInfo.signerName.toLowerCase().trim();
       const uNameNorm = user.name.toLowerCase().trim();
-      if (cNameNorm !== uNameNorm && !uNameNorm.includes('quản trị viên') && !uNameNorm.includes('admin')) {
-        mismatchWarning = {
+      if (cNameNorm !== uNameNorm && (!user || !['ADMIN', 'SYSTEM_ADMIN'].includes(user.role))) {
+        return res.status(403).json({
+          success: false,
+          code: 'CERT_IDENTITY_MISMATCH',
           webUser: user.name,
           certUser: certInfo.signerName,
-          cccd: cleanAccount,
-          message: `Tài khoản Web hiện tại là [${user.name}], nhưng Chứng thư số Ban Cơ yếu là của [${certInfo.signerName}].`
-        };
+          message: `Chứng thư số [${certInfo.signerName}] không khớp với tài khoản [${user.name}]. Vui lòng đăng nhập đúng tài khoản!`
+        });
       }
     }
 
@@ -4241,13 +4243,11 @@ app.post('/api/vgca/login', (req, res) => {
 
     if (user && user.id) {
       try {
-        const updatePayload = { vgcaAuth: vgcaAuthData, cccd: isCCCD ? cleanAccount : (user.cccd || '052085001234') };
-        if (switchSession && certInfo && certInfo.signerName) {
-          updatePayload.name = certInfo.signerName;
-        }
-        dataStore.updateUser(user.id, updatePayload);
+        const updatePayload = { vgcaAuth: vgcaAuthData };
+        if (isCCCD && cleanAccount) updatePayload.cccd = cleanAccount; else if (user.cccd) updatePayload.cccd = user.cccd;
+        await dataStore.updateUser(user.id, updatePayload);
       } catch (e) {
-        console.warn('Lỗi lưu vgcaAuth:', e.message);
+        console.error('Lỗi lưu vgcaAuth:', e.message); return res.status(500).json({ success: false, message: 'Lỗi lưu thông tin tài khoản VGCA' });
       }
     }
 
@@ -4314,105 +4314,105 @@ app.post('/api/vgca/logout', (req, res) => {
   res.json({ success: true, message: 'Đã đăng xuất tài khoản VGCA thành công.' });
 });
 
-// API Khởi tạo phiên ký số SmartCA / Remote VGCA (Gửi thông báo xác thực tới điện thoại)
-app.post('/api/vgca/initiate-session', (req, res) => {
+// API Khởi tạo phiên ký số SmartCA / Remote VGCA (Hỗ trợ Gateway & Mô phỏng Sandbox)
+app.post('/api/vgca/initiate-session', requireAuth, (req, res) => {
   try {
-    const { docTitle, signerName, mode, vgcaAccount, vgcaPin } = req.body || {};
-
-    // Tạo mã giao dịch Transaction ID duy nhất chuẩn VGCA
-    const randomCode = Math.floor(100000 + Math.random() * 900000);
-    const txId = `VGCA-2026-TX${randomCode}`;
-
+    const user = req.user || {};
+    if (!user.id) return res.status(401).json({ success: false, message: 'Tài khoản thiếu định danh hợp lệ.' });
+    if (!['ADMIN', 'BGH', 'HEAD_DEPT', 'TEACHER'].includes(user.role || '')) return res.status(403).json({ success: false, message: 'Bạn không có quyền khởi tạo phiên ký số VGCA!' });
+    const b = req.body || {};
+    if (typeof b.signerName === 'string' && b.signerName.length > 256) return res.status(400).json({ success: false, message: 'Tên người ký không được vượt quá 256 ký tự.' });
+    if (typeof b.vgcaAccount === 'string' && b.vgcaAccount.length > 256) return res.status(400).json({ success: false, message: 'Tài khoản VGCA không được vượt quá 256 ký tự.' });
+    if (typeof b.docTitle === 'string' && b.docTitle.length > 500) return res.status(400).json({ success: false, message: 'Tiêu đề văn bản không được vượt quá 500 ký tự.' });
+    const validModes = ['smartca', 'remote', 'usb_token'];
+    const cleanMode = (typeof b.mode === 'string' && validModes.includes(b.mode.toLowerCase())) ? b.mode.toLowerCase() : 'smartca';
+    const signerName = user.name || (typeof b.signerName === 'string' && b.signerName.trim() ? b.signerName.trim() : 'Giáo viên');
+    const vgcaAccount = (user.vgcaAuth && user.vgcaAuth.account) || user.email || (typeof b.vgcaAccount === 'string' && b.vgcaAccount.trim() ? b.vgcaAccount.trim() : `${user.username || 'user'}@quangngai.gov.vn`);
+    const docTitle = typeof b.docTitle === 'string' && b.docTitle.trim() ? b.docTitle.trim() : 'Kế hoạch bài dạy';
+    if (vgcaSessions.size >= 1000) return res.status(429).json({ success: false, message: 'Hệ thống đang bận xử lý, vui lòng thử lại sau.' });
+    for (const [oldTx, s] of vgcaSessions.entries()) { if (s.userId === user.id && s.status === 'WAITING_CONFIRMATION') vgcaSessions.delete(oldTx); }
+    const isSimulated = !process.env.VGCA_TSE_ENDPOINT;
+    const txId = `VGCA-2026-TX${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
     const session = {
-      txId,
-      docTitle: docTitle || 'Kế hoạch bài dạy',
-      signerName: signerName || (req.user ? req.user.name : 'Hà Văn Tý'),
-      vgcaAccount: vgcaAccount || 'hvty-dakha@quangngai.gov.vn',
-      mode: mode || 'smartca',
-      status: 'WAITING_CONFIRMATION',
-      createdAt: Date.now(),
-      expiresAt: Date.now() + 90000
+      txId, userId: user.id, docTitle, signerName, vgcaAccount, mode: cleanMode,
+      status: 'WAITING_CONFIRMATION', isSimulated, createdAt: Date.now(), expiresAt: Date.now() + 90000
     };
-
     vgcaSessions.set(txId, session);
-    console.log(`[VGCA SmartCA] 📲 Đã khởi tạo phiên giao dịch ${txId} cho ${session.signerName} (${session.vgcaAccount})`);
-
-    res.json({
-      success: true,
-      txId,
-      status: session.status,
-      expiresInSeconds: 90,
-      message: `Đã gửi thông báo xác thực tới điện thoại của ${session.signerName}. Xin mời mở ứng dụng SmartCA và chọn [Xác nhận].`
-    });
+    const expTimer = setTimeout(() => { const s = vgcaSessions.get(txId); if (s?.status === 'WAITING_CONFIRMATION') vgcaSessions.delete(txId); }, 90000);
+    if (expTimer && typeof expTimer.unref === 'function') expTimer.unref();
+    console.log(`[VGCA SmartCA${isSimulated ? ' Mock' : ''}] 📲 Đã tạo phiên ${txId} cho ${user.username || user.id}`);
+    const initMsg = isSimulated ? `[Mô phỏng SmartCA] Đã tạo phiên giao dịch ${txId} cho ${session.signerName}. Sẵn sàng xác thực.` : `Đã gửi yêu cầu xác thực SmartCA tới thiết bị của ${session.signerName}.`;
+    res.json({ success: true, txId, status: session.status, expiresInSeconds: 90, isSimulation: isSimulated, message: initMsg });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Lỗi khởi tạo phiên ký số: ' + err.message });
+    console.error('Lỗi khởi tạo phiên ký số:', err); res.status(500).json({ success: false, message: 'Lỗi khởi tạo phiên ký số' });
   }
 });
 
-// API Người dùng xác nhận đã bấm đồng ý trên điện thoại
-app.post('/api/vgca/confirm-session', (req, res) => {
+// API Xác nhận phiên ký số SmartCA (Kiểm tra token provider hoặc xác thực sandbox)
+app.post('/api/vgca/confirm-session', requireAuth, (req, res) => {
   try {
-    const { txId } = req.body || {};
-    if (!txId) {
-      return res.status(400).json({ success: false, message: 'Thiếu mã giao dịch ký số (txId).' });
+    const { txId, confirmationToken } = req.body || {};
+    if (!txId || typeof txId !== 'string') return res.status(400).json({ success: false, message: 'Thiếu mã giao dịch ký số (txId) hợp lệ.' });
+    const cleanTxId = txId.trim();
+    if (cleanTxId.length > 100) return res.status(400).json({ success: false, message: 'Mã giao dịch ký số không hợp lệ.' });
+    const session = vgcaSessions.get(cleanTxId);
+    if (!session) return res.status(404).json({ success: false, message: 'Phiên giao dịch ký số không tồn tại hoặc đã hết hạn.' });
+    if (session.status !== 'WAITING_CONFIRMATION') return res.status(400).json({ success: false, message: 'Trạng thái phiên không hợp lệ để xác nhận.' });
+    if (session.expiresAt && Date.now() > session.expiresAt) {
+      vgcaSessions.delete(cleanTxId);
+      return res.status(400).json({ success: false, message: 'Phiên giao dịch ký số đã hết hạn.' });
     }
-
-    let session = vgcaSessions.get(txId);
-    if (!session) {
-      // Tự động khôi phục phiên nếu server Render vừa restart / wake-up từ chế độ ngủ
-      session = {
-        txId,
-        signerName: (req.user ? req.user.name : 'Ban Giám hiệu'),
-        status: 'CONFIRMED',
-        createdAt: Date.now() - 5000,
-        expiresAt: Date.now() + 180000,
-        confirmedAt: new Date().toISOString().replace('T', ' ').substring(0, 19)
-      };
-      vgcaSessions.set(txId, session);
-      console.log(`[VGCA SmartCA] 🔄 Đã tự động khôi phục và xác nhận phiên: ${txId}`);
-    } else {
-      session.status = 'CONFIRMED';
-      session.confirmedAt = new Date().toISOString().replace('T', ' ').substring(0, 19);
-      console.log(`[VGCA SmartCA] ✅ Người dùng đã xác nhận trên điện thoại cho phiên: ${txId}`);
+    const callerId = req.user && req.user.id;
+    if (!callerId) return res.status(401).json({ success: false, message: 'Tài khoản thiếu định danh hợp lệ.' });
+    if (session.userId !== callerId && req.user.role !== 'ADMIN') {
+      return res.status(403).json({ success: false, message: 'Bạn không có quyền xác nhận phiên giao dịch này.' });
     }
-
+    if (!session.isSimulated && (typeof confirmationToken !== 'string' || typeof session.confirmationToken !== 'string' || session.confirmationToken.length === 0 || confirmationToken !== session.confirmationToken)) {
+      return res.status(400).json({ success: false, message: 'Mã xác thực SmartCA không hợp lệ hoặc không khớp với phiên ký.' });
+    }
+    session.status = 'CONFIRMED';
+    session.confirmedAt = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    const confTimer = setTimeout(() => { vgcaSessions.delete(cleanTxId); }, 180000); if (confTimer && typeof confTimer.unref === 'function') confTimer.unref();
     res.json({
       success: true,
-      txId,
+      txId: cleanTxId,
       status: 'CONFIRMED',
       confirmedAt: session.confirmedAt,
       message: 'Xác nhận điện thoại thành công! Sẵn sàng niêm phong chữ ký số PAdES X.509.'
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Lỗi xác nhận phiên ký số: ' + err.message });
+    console.error('[VGCA Confirm Error]:', err); res.status(500).json({ success: false, message: 'Lỗi xác nhận phiên ký số.' });
   }
 });
 
-// API Tra cứu trạng thái phiên ký số
-app.get('/api/vgca/session-status/:txId', (req, res) => {
-  const txId = req.params.txId;
-  let session = vgcaSessions.get(txId);
-  if (!session) {
-    // Tránh trả về 404 làm sập giao diện client polling khi Render vừa thức dậy
-    session = {
-      txId,
-      status: 'WAITING_CONFIRMATION',
-      createdAt: Date.now(),
-      expiresAt: Date.now() + 90000
-    };
-  }
-  res.json({ success: true, data: session });
+// API Tra cứu trạng thái phiên ký số (Chỉ trả metadata an toàn cho chủ phiên)
+app.get('/api/vgca/session-status/:txId', requireAuth, (req, res) => {
+  const txId = (req.params.txId || '').trim();
+  if (!txId || txId.length > 100) return res.status(400).json({ success: false, message: 'txId không hợp lệ' });
+  const session = vgcaSessions.get(txId);
+  if (!session) return res.status(404).json({ success: false, message: 'Phiên không tồn tại hoặc đã hết hạn.' });
+  const isOwner = Boolean(session.userId && session.userId === req.user?.id);
+  if (req.user?.role !== 'ADMIN' && !isOwner) return res.status(403).json({ success: false, message: 'Bạn không có quyền xem phiên này.' });
+  res.json({
+    success: true,
+    data: { txId: session.txId, status: session.status, expiresAt: session.expiresAt, confirmedAt: session.confirmedAt || null }
+  });
 });
 
-// API Hủy bỏ phiên ký số
-app.post('/api/vgca/cancel-session', (req, res) => {
+// API Hủy bỏ phiên ký số (Bảo vệ RBAC & Xác thực quyền sở hữu)
+app.post('/api/vgca/cancel-session', requireAuth, (req, res) => {
   const { txId } = req.body || {};
-  if (txId && vgcaSessions.has(txId)) {
-    const session = vgcaSessions.get(txId);
-    session.status = 'CANCELLED';
-    console.log(`[VGCA SmartCA] 🛑 Đã hủy phiên ký số: ${txId}`);
+  if (!txId || typeof txId !== 'string') return res.status(400).json({ success: false, message: 'Thiếu txId hợp lệ.' });
+  const cleanTxId = txId.trim();
+  if (cleanTxId.length > 100) return res.status(400).json({ success: false, message: 'txId không hợp lệ.' });
+  const session = vgcaSessions.get(cleanTxId);
+  if (!session) return res.status(404).json({ success: false, message: 'Phiên không tồn tại hoặc đã hết hạn.' });
+  const isOwner = Boolean(session.userId && session.userId === req.user?.id);
+  if (req.user?.role !== 'ADMIN' && !isOwner) {
+    return res.status(403).json({ success: false, message: 'Bạn không có quyền hủy phiên này.' });
   }
-  res.json({ success: true, message: 'Đã hủy phiên ký số.' });
+  session.status = 'CANCELLED'; session.cancelledAt = Date.now();
+  res.json({ success: true, message: 'Đã hủy phiên ký số thành công.' });
 });
 
 // Phục vụ tải về công cụ EduSign Desktop Agent cho máy tính Windows
@@ -4485,86 +4485,77 @@ app.get('/api/health', (req, res) => {
 
 // Cầu nối Ký số Cục bộ (Local Signer Bridge) phục vụ khi truy cập từ Cloud Render
 app.get('/api/ping-local-signer', (req, res) => {
-  res.json({
-    success: true,
-    service: 'EduSign-VGCA-Local-Agent',
-    platform: process.platform,
-    hasRealVgca: process.platform === 'win32',
-    signer: realSigner
-  });
+  res.json({ success: true, service: 'EduSign-VGCA-Local-Agent', platform: process.platform, hasRealVgca: process.platform === 'win32', signer: realSigner });
 });
 
-app.post('/api/local-sign-doc', async (req, res) => {
+app.post('/api/local-sign-doc', requireAuth, async (req, res) => {
   try {
-    const docData = req.body.doc || {};
-    const fileBase64 = req.body.fileBase64 || docData.fileBase64;
-
-    console.log(`[Local Signer] Nhận yêu cầu ký số thật từ trình duyệt cho tài liệu: ${docData.title}`);
-
-    const uploadDir = path.join(__dirname, 'uploads', 'documents');
-    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-
+    const roles = ['TEACHER', 'DEPARTMENT_HEAD', 'HEAD_DEPT', 'LEADER', 'TO_TRUONG', 'PRINCIPAL', 'VICE_PRINCIPAL', 'BGH', 'ADMIN', 'CLERK'];
+    if (!req.user || !roles.includes(String(req.user.role || '').toUpperCase())) return res.status(403).json({ success: false, message: 'Tài khoản không có quyền ký số.' });
+    const b = (req.body && typeof req.body === 'object') ? req.body : {};
+    const docData = (b.doc && typeof b.doc === 'object') ? b.doc : {};
+    const safeTitle = String(docData.title || 'Kế hoạch bài dạy').replace(/[\r\n\x00-\x1f]/g, ' ').trim().slice(0, 150);
+    console.log(`[Local Signer] Nhận yêu cầu ký số thật cho tài liệu: ${safeTitle}`);
+    const fileBase64 = typeof b.fileBase64 === 'string' ? b.fileBase64 : (typeof docData.fileBase64 === 'string' ? docData.fileBase64 : null);
+    const uploadDir = path.join(__dirname, 'uploads', 'documents'); if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
     let tempFilePath = null;
     if (fileBase64) {
-      const ext = (docData.fileName || '').endsWith('.docx') ? 'docx' : 'pdf';
-      tempFilePath = path.join(uploadDir, `local_temp_${Date.now()}.${ext}`);
-      fs.writeFileSync(tempFilePath, Buffer.from(fileBase64.replace(/^data:[^;]+;base64,/, ''), 'base64'));
+      const rawB64 = fileBase64.replace(/^data:[^;]+;base64,/, '').replace(/[\r\n\s]/g, '');
+      const maxB64 = Math.ceil((25 * 1024 * 1024) / 3) * 4; if (rawB64.length > maxB64) return res.status(413).json({ success: false, message: 'Tệp vượt quá giới hạn 25MB.' });
+      const b64Regex = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}\x3D\x3D|[A-Za-z0-9+/]{3}\x3D|[A-Za-z0-9+/]{4})$/; if (!rawB64 || rawB64.length % 4 !== 0 || !b64Regex.test(rawB64)) return res.status(400).json({ success: false, message: 'Dữ liệu Base64 không hợp lệ.' });
+      const fileBuf = Buffer.from(rawB64, 'base64'); if (fileBuf.length === 0 || fileBuf.length > 25 * 1024 * 1024) return res.status(413).json({ success: false, message: 'Kích thước tệp không hợp lệ.' });
+      let isPdf = false, isDocx = false;
+      if (fileBuf.length >= 5 && fileBuf.subarray(0, 5).toString('ascii') === '%PDF-') {
+        try {
+          const { PDFDocument } = require('pdf-lib'); await PDFDocument.load(fileBuf, { ignoreEncryption: true });
+          const hasSchoolSealArtifact = verifySchoolSealArtifact; if (!hasSchoolSealArtifact(fileBuf)) return res.status(400).json({ success: false, message: 'Tệp PDF thiếu con dấu hoặc chữ ký số hợp chuẩn.' });
+          isPdf = true;
+        } catch (e) { return res.status(400).json({ success: false, message: 'Định dạng tệp PDF không hợp lệ hoặc bị hỏng.' }); }
+      } else if (fileBuf.length >= 100 && fileBuf.readUInt32LE(0) === 0x04034b50) {
+        let eocd = -1; for (let i = fileBuf.length - 22; i >= Math.max(0, fileBuf.length - 65557); i--) { if (fileBuf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; } }
+        if (eocd !== -1 && eocd + 22 <= fileBuf.length) {
+          const cdOff = fileBuf.readUInt32LE(eocd + 16), cdCnt = fileBuf.readUInt16LE(eocd + 10);
+          if (cdOff < eocd && cdCnt > 0 && cdOff >= 0) {
+            let p = cdOff, hasCT = false, hasDoc = false, zipValid = true;
+            for (let i = 0; i < cdCnt && p < eocd; i++) {
+              if (p + 46 > eocd || fileBuf.readUInt32LE(p) !== 0x02014b50) { zipValid = false; break; }
+              const nLen = fileBuf.readUInt16LE(p + 28), xLen = fileBuf.readUInt16LE(p + 30), cLen = fileBuf.readUInt16LE(p + 32), locOff = fileBuf.readUInt32LE(p + 42);
+              if (p + 46 + nLen + xLen + cLen > eocd || locOff + 30 > cdOff || fileBuf.readUInt32LE(locOff) !== 0x04034b50) { zipValid = false; break; }
+              const name = fileBuf.subarray(p + 46, p + 46 + nLen).toString('utf8');
+              if (name === '[Content_Types].xml') hasCT = true;
+              if (name === 'word/document.xml') hasDoc = true;
+              p += 46 + nLen + xLen + cLen;
+            }
+            if (zipValid && hasCT && hasDoc) isDocx = true;
+          }
+        }
+        if (!isDocx) return res.status(400).json({ success: false, message: 'Định dạng tệp DOCX không hợp lệ.' });
+      }
+      if (!isPdf && !isDocx) return res.status(400).json({ success: false, message: 'Chỉ chấp nhận tệp PDF hoặc DOCX hợp lệ.' });
+      const ext = isDocx ? 'docx' : 'pdf'; tempFilePath = path.join(uploadDir, `local_temp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`);
+      await fs.promises.writeFile(tempFilePath, fileBuf);
     }
-
-    const isCopy = (docData.signType === 'COPY' || docData.isCopySign === true || req.body.signType === 'COPY' || req.body.isCopySign === true);
+    const isCopy = (docData.signType === 'COPY' || docData.isCopySign === true || b.signType === 'COPY' || b.isCopySign === true);
     const tempDoc = {
-      id: docData.id || 'DOC_' + Date.now(),
-      title: docData.title || 'Kế hoạch bài dạy',
-      author: docData.author || 'Hà Văn Tý',
-      department: docData.department || 'Tổ Toán - Tin',
-      filePath: tempFilePath,
-      isPreStamped: !!docData.isPreStamped,
+      id: docData.id || 'DOC_' + Date.now(), title: docData.title || 'Kế hoạch bài dạy', author: docData.author || 'Hà Văn Tý', department: docData.department || 'Tổ Toán - Tin', filePath: tempFilePath, isPreStamped: !!docData.isPreStamped,
       signPlacement: isCopy ? 'top-right' : (docData.signPlacement || 'bottom-right'),
-      signCoordinates: docData.signCoordinates || req.body.signCoordinates || (typeof req.body.x === 'number' || typeof req.body.xPercent === 'number' ? {
-        x: req.body.x,
-        y: req.body.y,
-        page: req.body.page || req.body.targetPage,
-        targetPage: req.body.targetPage || req.body.page,
-        width: req.body.width,
-        height: req.body.height,
-        xPercent: req.body.xPercent,
-        yPercent: req.body.yPercent,
-        isManualDrag: !!req.body.isManualDrag
-      } : null),
-      page: req.body.page || req.body.targetPage || docData.page || 0,
-      signType: isCopy ? 'COPY' : (docData.signType || 'STANDARD'),
-      isCopySign: isCopy,
-      copyType: isCopy ? (docData.copyType || req.body.copyType || 'SAO Y') : null,
-      copyText: isCopy ? (docData.copyText || req.body.copyText || null) : null,
-      copySignBannerBase64: isCopy ? (docData.copySignBannerBase64 || req.body.copySignBannerBase64 || null) : null,
-      copySignBannerWidthPt: isCopy ? (docData.copySignBannerWidthPt || req.body.copySignBannerWidthPt || null) : null,
-      copySignBannerHeightPt: isCopy ? (docData.copySignBannerHeightPt || req.body.copySignBannerHeightPt || null) : null,
+      signCoordinates: docData.signCoordinates || b.signCoordinates || ((typeof b.x === 'number' || typeof b.xPercent === 'number') ? { x: b.x, y: b.y, page: b.page || b.targetPage, targetPage: b.targetPage || b.page, width: b.width, height: b.height, xPercent: b.xPercent, yPercent: b.yPercent, isManualDrag: !!b.isManualDrag } : null),
+      page: b.page || b.targetPage || docData.page || 0, signType: isCopy ? 'COPY' : (docData.signType || 'STANDARD'), isCopySign: isCopy, copyType: isCopy ? (docData.copyType || b.copyType || 'SAO Y') : null, copyText: isCopy ? (docData.copyText || b.copyText || null) : null,
+      copySignBannerBase64: isCopy ? (docData.copySignBannerBase64 || b.copySignBannerBase64 || null) : null, copySignBannerWidthPt: isCopy ? (docData.copySignBannerWidthPt || b.copySignBannerWidthPt || null) : null, copySignBannerHeightPt: isCopy ? (docData.copySignBannerHeightPt || b.copySignBannerHeightPt || null) : null,
       signatureImage: isCopy ? null : (docData.signatureImage || null),
       signatures: isCopy ? [] : (docData.signatures || [{
-        step: 1,
-        role: 'Giáo viên',
-        signerName: docData.author || 'Hà Văn Tý',
-        visualSignImage: docData.signatureImage || '/uploads/signatures/sig_user_cvaty.png'
+        step: 1, role: 'Giáo viên', signerName: docData.author || 'Hà Văn Tý', visualSignImage: docData.signatureImage || '/uploads/signatures/sig_user_cvaty.png'
       }])
     };
-
     const signResult = await pdfSignerService.signWithRealVgca(tempDoc);
     const signedPdfBase64 = 'data:application/pdf;base64,' + signResult.signedBuffer.toString('base64');
-
-    try { if (tempFilePath && fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch (unlinkErr) { console.warn('[Local Signer] Lỗi xóa tệp tạm:', unlinkErr.message); }
-
-    res.json({
-      success: true,
-      message: 'Ký số mật mã thật VGCA thành công! Điện thoại đã xác nhận.',
-      signedPdfBase64,
-      stdout: signResult.stdout
-    });
+    res.json({ success: true, message: 'Ký số mật mã thật VGCA thành công! Điện thoại đã xác nhận.', signedPdfBase64, stdout: signResult.stdout });
   } catch (err) {
-    console.error('[Local Signer] Lỗi ký số:', err.message);
-    res.status(500).json({
-      success: false,
-      message: 'Lỗi ký số VGCA trên máy tính: ' + err.message
-    });
+    const errId = crypto.randomBytes(4).toString('hex');
+    console.error(`[Local Signer][${errId}] Lỗi ký số:`, err.message);
+    res.status(500).json({ success: false, errCode: 'SIGNING_FAILED', message: 'Không thể hoàn tất ký số VGCA trên máy tính.' });
+  } finally {
+    try { if (tempFilePath && fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch (unlinkErr) { console.warn('[Local Signer] Lỗi xóa tệp tạm:', unlinkErr.message); }
   }
 });
 
@@ -4576,74 +4567,83 @@ app.post('/api/documents', requireAuth, async (req, res) => {
     txId, tokenPin, signType, copyType, copyText, copySignBannerBase64,
     copySignBannerWidthPt, copySignBannerHeightPt,
     category, nextSignerId, nextSignerName, nextSignerRole
-  } = req.body;
+  } = req.body || {};
 
-  if (!title) {
+  if (!title || typeof title !== 'string' || !title.trim()) {
     return res.status(400).json({ success: false, message: 'Vui lòng nhập Tên kế hoạch bài dạy / Báo cáo!' });
   }
 
   const currentUser = req.user;
-  const isCopy = signType === 'COPY' || req.body.isCopySign === true;
+  const isCopy = (signType === 'COPY' || (req.body && req.body.isCopySign === true));
   const activeSigImage = isCopy ? null : (signatureImage || currentUser.signatureImage || null);
   const docCategory = (category === 'REPORT') ? 'REPORT' : 'PERSONAL';
-  const initialStatus = (docCategory === 'PERSONAL')
-    ? 'COMPLETED'
-    : (nextSignerId ? 'WAITING_NEXT_SIGN' : 'SUBMITTED');
-  const initialRole = (docCategory === 'PERSONAL')
-    ? 'Hoàn tất tự ký cá nhân'
-    : (nextSignerRole || 'Người duyệt tiếp theo');
+  const initialStatus = (docCategory === 'PERSONAL') ? 'COMPLETED' : (nextSignerId ? 'WAITING_NEXT_SIGN' : 'SUBMITTED');
+  const initialRole = (docCategory === 'PERSONAL') ? 'Hoàn tất tự ký cá nhân' : (nextSignerRole || 'Người duyệt tiếp theo');
 
-  // BẮT BUỘC PHẢI CÓ CHỮ KÝ HỢP LỆ TRƯỚC KHI NỘP (ngoại trừ ký sao y)
-  if (!activeSigImage && !isCopy) {
-    return res.status(400).json({
-      success: false,
-      message: 'Vui lòng thực hiện ký số vào văn bản trước khi nộp!'
-    });
+  // 1. Kiểm tra chữ ký hiển thị (Visual Signature Appearance) - không dùng thay thế chữ ký mật mã
+  const isValidVisualSig = Boolean(activeSigImage && typeof activeSigImage === 'string' && (activeSigImage.startsWith('data:image/') || activeSigImage.startsWith('/uploads/') || activeSigImage.startsWith('http')));
+  if (!isCopy && !isValidVisualSig) {
+    return res.status(400).json({ success: false, message: 'Vui lòng thực hiện ký số vào văn bản trước khi nộp!' });
   }
 
-  // NGUYÊN TẮC VÀNG BAN CƠ YẾU CHÍNH PHỦ & HỌC BẠ SỐ: Chỉ được nộp hồ sơ khi ĐÃ KÝ SỐ THÀNH CÔNG!
-  if (realVgcaSign && !realSignedPdfBase64) {
-    if (!txId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Nguyên tắc an toàn: Văn bản bắt buộc phải được ký số mật mã thật trước khi nộp vào hệ thống!'
-      });
+  // 2. Kiểm tra chữ ký số mật mã bắt buộc (Cryptographic Digital Signature PKCS#7/ByteRange)
+  if (!isCopy) {
+    if (realSignedPdfBase64) {
+      if (typeof realSignedPdfBase64 !== 'string' || realSignedPdfBase64.length > 50331648) return res.status(400).json({ success: false, message: 'Dữ liệu Base64 vượt hạn mức cho phép.' });
+      const rawB64 = realSignedPdfBase64.replace(/^data:[^;]+;base64,/, '').replace(/[\r\n\s]/g, '');
+      const b64Regex = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}\x3D\x3D|[A-Za-z0-9+/]{3}\x3D|[A-Za-z0-9+/]{4})$/;
+      if (!rawB64 || rawB64.length % 4 !== 0 || !b64Regex.test(rawB64)) return res.status(400).json({ success: false, message: 'Dữ liệu Base64 tệp ký không hợp lệ.' });
+      const signedBuf = Buffer.from(rawB64, 'base64');
+      const isPdf = signedBuf.length >= 100 && signedBuf.subarray(0, 5).toString('ascii') === '%PDF-' && signedBuf.subarray(Math.max(0, signedBuf.length - 2048)).toString('latin1').includes('%%EOF');
+      /* Tier 2 CMS/PKCS#7 Verification (SPEC.md L174-184) */ const evaluatePdfSignatureCandidate = (b) => { if (!b || !Buffer.isBuffer(b) || b.length < 100 || b.length > 50331648 || b.subarray(0, 5).toString('ascii') !== '%PDF-' || !b.subarray(Math.max(0, b.length - 2048)).toString('latin1').includes('%%EOF')) return false; const sigBlocks = []; let pos = 0, scanCount = 0; while ((pos = b.indexOf('/ByteRange', pos + 1)) !== -1) { if (++scanCount > 20) return false; const oS = b.lastIndexOf('obj', pos), oE = b.indexOf('endobj', pos); if (oS !== -1 && oE > oS && (oE - oS) < 131072) { const sd = b.subarray(oS, oE + 6).toString('latin1'); if (/\/Type\s*\/Sig\b/.test(sd) && sd.includes('/Contents')) sigBlocks.push(sd); } } if (!sigBlocks.length || sigBlocks.length > 10) return false; const active = []; for (const sd of sigBlocks) { const br = sd.match(/\/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]/); if (!br) continue; const [o1, l1, o2, l2] = [+br[1], +br[2], +br[3], +br[4]]; if (o1 !== 0 || l1 <= 0 || o2 < (o1 + l1) || l2 <= 0 || (o2 + l2) > b.length) continue; if (!/\/Contents\s*$/.test(b.subarray(Math.max(0, o1 + l1 - 32), o1 + l1).toString('latin1'))) continue; const gap = b.subarray(o1 + l1, o2).toString('latin1'); if (gap.length < 10 || gap[0] !== '<' || gap[gap.length - 1] !== '>' || !/^<[0-9a-fA-F\s]+>$/.test(gap) || o2 !== (o1 + l1 + gap.length)) continue; const tr = b.subarray(o2 + l2).toString('latin1'); if (tr.includes('obj') || tr.includes('xref') || tr.includes('trailer') || tr.includes('/Type') || !/^\s*(?:%%EOF)?\s*$/.test(tr.replace(/%%EOF/g, ''))) continue; active.push({ cs: sd, o1, l1, o2, l2, gap }); } if (active.length !== 1) return false; const { cs, o1, l1, o2, l2, gap } = active[0]; const fm = cs.match(/\/Filter\s*\/([a-zA-Z0-9._]+)/), sfm = cs.match(/\/SubFilter\s*\/([a-zA-Z0-9._]+)/); if (!fm || !/^(?:Adobe\.PPKLite|ETSI\.CAdES|Adobe\.PPKMS)$/.test(fm[1]) || !sfm || !/^(?:adbe\.pkcs7\.detached|ETSI\.CAdES\.detached)$/.test(sfm[1])) return false; const hex = gap.slice(1, -1).replace(/\s+/g, ''); if (hex.length < 64 || hex.length % 2 !== 0) return false; const der = Buffer.from(hex, 'hex'); const tlv = (buf, p = 0) => { if (!buf || p < 0 || p + 2 > buf.length) return null; let len = buf[p + 1], hl = 2; if (len & 0x80) { const n = len & 0x7f; if (!n || n > 4 || p + 2 + n > buf.length) return null; len = 0; for (let i = 0; i < n; i++) len = (len << 8) | buf[p + 2 + i]; hl = 2 + n; } const next = p + hl + len; return (len < 0 || next > buf.length) ? null : { tag: buf[p], len, hl, pos: p, next, val: buf.subarray(p + hl, next) }; }; const root = tlv(der, 0); if (!root || root.tag !== 0x30) return false; const ct = tlv(der, root.pos + root.hl); if (!ct || ct.tag !== 0x06 || ct.val.toString('hex') !== '2a864886f70d010702') return false; const content = tlv(der, ct.next); if (!content || content.tag !== 0xa0) return false; const mdOid = Buffer.from('06092a864886f70d010904', 'hex'), oidPos = content.val.indexOf(mdOid); if (oidPos === -1) return false; const oidTLV = tlv(content.val, oidPos); if (!oidTLV || oidTLV.len !== 9) return false; const setTLV = tlv(content.val, oidTLV.next); if (!setTLV || setTLV.tag !== 0x31) return false; const octetTLV = tlv(content.val, setTLV.pos + setTLV.hl); if (!octetTLV || octetTLV.tag !== 0x04 || octetTLV.val.length !== 32) return false; if (!crypto.timingSafeEqual(octetTLV.val, crypto.createHash('sha256').update(b.subarray(o1, o1 + l1)).update(b.subarray(o2, o2 + l2)).digest())) return false; const sdSeq = tlv(content.val, 0); if (!sdSeq || sdSeq.tag !== 0x30) return false; let sp = 0, certsField = null, siField = null; while (sp < sdSeq.val.length) { const item = tlv(sdSeq.val, sp); if (!item || item.next <= sp) break; if (item.tag === 0xa0 && !certsField) certsField = item; else if (item.tag === 0x31 && certsField) { siField = item; break; } sp = item.next; } if (!certsField || !siField) return false; const cmsCerts = []; let cp = 0; while (cp < certsField.val.length) { const cItem = tlv(certsField.val, cp); if (!cItem || cItem.tag !== 0x30 || cItem.next <= cp) break; try { const c = new crypto.X509Certificate(certsField.val.subarray(cItem.pos, cItem.next)); if (!cmsCerts.some(x => x.fingerprint256 === c.fingerprint256)) cmsCerts.push(c); } catch (e) { console.warn('[PDF CMS Auth] Parse cert err:', e.message); } cp = cItem.next; } if (!cmsCerts.length) return false; const siItem = tlv(siField.val, 0); if (!siItem || siItem.tag !== 0x30) return false; const siVer = tlv(siItem.val, 0); if (!siVer) return false; const sid = tlv(siItem.val, siVer.next); if (!sid) return false; const sidIssuer = tlv(sid.val, 0); if (!sidIssuer) return false; const sidSerial = tlv(sid.val, sidIssuer.next); if (!sidSerial || !sidSerial.val) return false; const sidSerialHex = sidSerial.val.toString('hex').replace(/^0+/, '').toLowerCase(); const signerCert = cmsCerts.find(c => c.serialNumber.replace(/^0+/, '').toLowerCase() === sidSerialHex); if (!signerCert || signerCert.subject === signerCert.issuer) return false; const now = new Date(); if (now < new Date(signerCert.validFrom) || now > new Date(signerCert.validTo) || !signerCert.publicKey) return false; const subj = (signerCert.subject || '').normalize('NFC').toLowerCase(); const issuer = (signerCert.issuer || '').normalize('NFC').toLowerCase(); const authKw = ['chu văn an', 'chu van an', 'thcs', 'trường', 'truong', 'hà văn tý', 'ha van ty', 'cơ yếu', 'co yeu', 'vgca', 'quảng ngãi', 'quang ngai']; const knownPins = ['5bf526c46f63054f2f5a79dea561ab24dde226f308e5e98e18801a113ec3c3dd', '83f0fe82e1ae7fc9e5b9d6c549828a4301b3bcc02699176db5890f83be75f34e']; const certFp = signerCert.fingerprint256.replace(/:/g, '').toLowerCase(); if (!knownPins.includes(certFp) && (!authKw.some(k => subj.includes(k)) || !authKw.some(k => issuer.includes(k)))) return false; let sip = 0, signedAttrsTLV = null, sigTLV = null; while (sip < siItem.val.length) { const fld = tlv(siItem.val, sip); if (!fld || fld.next <= sip) break; if (fld.tag === 0xa0 && !signedAttrsTLV) signedAttrsTLV = fld; else if (fld.tag === 0x04 && !sigTLV) sigTLV = fld; sip = fld.next; } if (!signedAttrsTLV || !sigTLV) return false; const rawAttrs = Buffer.from(siItem.val.subarray(signedAttrsTLV.pos, signedAttrsTLV.next)); rawAttrs[0] = 0x31; if (!crypto.verify('SHA256', rawAttrs, signerCert.publicKey, sigTLV.val) && !crypto.verify('RSA-SHA256', rawAttrs, signerCert.publicKey, sigTLV.val)) return false; const CA_PINS = ['d8cab7a4aef92e6bb2509d7c61cee7b44f3731b2d21074963530277b366fae4b', 'f04ba4b459a7c9a1b971ad9b1cb833e695a80c79aea63b174b66a70edfe2fdb8', '83f0fe82e1ae7fc9e5b9d6c549828a4301b3bcc02699176db5890f83be75f34e', '5bf526c46f63054f2f5a79dea561ab24dde226f308e5e98e18801a113ec3c3dd']; const caKw = ['ban cơ yếu', 'ban co yeu', 'vgca', 'ca phục vụ', 'chính phủ']; if (!caKw.some(kw => signerCert.issuer.toLowerCase().includes(kw))) return false; let cur = signerCert, chainOk = CA_PINS.includes(cur.fingerprint256.replace(/:/g, '').toLowerCase()), depth = 0; while (!chainOk && depth < 5) { depth++; const parent = cmsCerts.find(p => p !== cur && (p.subject === cur.issuer || (typeof p.checkIssued === 'function' && p.checkIssued(cur)))); if (!parent || now < new Date(parent.validFrom) || now > new Date(parent.validTo)) return false; try { if (typeof cur.verify === 'function' && !cur.verify(parent.publicKey)) return false; } catch (e) { console.warn('[PDF CMS Auth] Verify parent err:', e.message); return false; } if (CA_PINS.includes(parent.fingerprint256.replace(/:/g, '').toLowerCase())) { chainOk = true; break; } if (parent.subject === parent.issuer) return false; cur = parent; } return chainOk; }; const isCandidateValid = isPdf && evaluatePdfSignatureCandidate(signedBuf); const verifierValid = isCandidateValid;
+      if (!verifierValid) return res.status(400).json({ success: false, message: 'Tệp PDF không thỏa mãn cấu trúc tiền kiểm ByteRange/PKCS#7 hoặc thiếu định danh hợp chuẩn.' });
     }
-    const session = vgcaSessions.get(txId);
-    if (!session || session.status !== 'CONFIRMED') {
-      return res.status(400).json({
-        success: false,
-        message: `Chưa nhận được xác nhận từ điện thoại cho phiên giao dịch ${txId}! Vui lòng mở ứng dụng SmartCA và nhấn [Xác nhận Ký] trên điện thoại trước khi nộp bài.`
-      });
+    if (realVgcaSign && !realSignedPdfBase64) { if (!txId) return res.status(400).json({ success: false, message: 'Nguyên tắc an toàn: Văn bản bắt buộc phải được ký số mật mã thật trước khi nộp vào hệ thống!' });
+      const session = vgcaSessions.get(txId);
+      if (!session || session.status !== 'CONFIRMED') {
+        return res.status(400).json({ success: false, message: `Chưa nhận được xác nhận từ điện thoại cho phiên giao dịch ${txId}! Vui lòng mở ứng dụng SmartCA và nhấn [Xác nhận Ký] trên điện thoại trước khi nộp bài.` });
+      }
     }
   }
 
   // Nếu người dùng ký trực tiếp trên modal và chưa lưu vào profile -> tự động lưu để tái sử dụng
-  if (!isCopy && signatureImage && !currentUser.signatureImage) {
-    dataStore.updateUser(currentUser.id, { signatureImage });
+  if (!isCopy && signatureImage && typeof signatureImage === 'string' && !currentUser.signatureImage) {
+    try { await dataStore.updateUser(currentUser.id, { signatureImage }); } catch (userErr) { console.warn('[Upload Document] Lỗi lưu chữ ký profile:', userErr.message); }
   }
 
   let savedFilePath = null;
-
+  const cleanOrphanFile = () => { if (savedFilePath && fs.existsSync(savedFilePath)) { try { fs.unlinkSync(savedFilePath); } catch (e) { console.warn('[Upload Document] Lỗi dọn tệp mồ côi:', e.message); } } };
   // Xử lý lưu file thật nếu có đính kèm
   if (fileBase64) {
+    if (typeof fileBase64 !== 'string') return res.status(400).json({ success: false, message: 'Dữ liệu tệp đính kèm không hợp lệ.' });
+    const cleanB64 = fileBase64.replace(/^data:[^;]+;base64,/, '').replace(/[\r\n\s]/g, '');
+    const maxB64 = Math.ceil((25 * 1024 * 1024) / 3) * 4;
+    if (!cleanB64 || cleanB64.length > maxB64 || cleanB64.length % 4 !== 0) return res.status(400).json({ success: false, message: 'Kích thước hoặc Base64 không hợp lệ.' });
+    const b64Check = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}\x3D\x3D|[A-Za-z0-9+/]{3}\x3D|[A-Za-z0-9+/]{4})$/;
+    if (!b64Check.test(cleanB64)) return res.status(400).json({ success: false, message: 'Dữ liệu Base64 tệp chứa ký tự không hợp lệ.' });
+    const rawBuffer = Buffer.from(cleanB64, 'base64');
+    if (rawBuffer.length === 0 || rawBuffer.length > 25 * 1024 * 1024) return res.status(413).json({ success: false, message: 'Dung lượng tệp đính kèm vượt giới hạn 25MB.' });
+    let ext = null;
+    if (rawBuffer.length >= 5 && rawBuffer.subarray(0, 5).toString('ascii') === '%PDF-') {
+      ext = '.pdf';
+    } else if (rawBuffer.length >= 4 && rawBuffer.readUInt32LE(0) === 0x04034b50) {
+      ext = '.docx';
+    } else {
+      return res.status(400).json({ success: false, message: 'Chỉ chấp nhận tệp định dạng PDF hoặc DOCX hợp lệ dựa trên nội dung nhị phân thực tế.' });
+    }
+    const safeBase = path.basename((fileName || 'GiaoAn').replace(/[^a-zA-Z0-9_\-\.]/g, '_'), path.extname(fileName || ''));
+    const uniqueFileName = `${Date.now()}_${crypto.randomUUID()}_${safeBase}${ext}`;
+    const uploadDir = path.join(__dirname, 'uploads', 'documents');
+    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+    savedFilePath = path.join(uploadDir, uniqueFileName);
     try {
-      const cleanBase64 = fileBase64.replace(/^data:[^;]+;base64,/, '');
-      const rawBuffer = Buffer.from(cleanBase64, 'base64');
-      const safeName = (fileName || 'GiaoAn').replace(/[^a-zA-Z0-9_\-\.]/g, '_');
-      const rawExt = (path.extname(safeName) || '').toLowerCase();
-      // SEC-07: Giới hạn chỉ chấp nhận phần mở rộng an toàn (.pdf, .docx)
-      const allowedExts = ['.pdf', '.docx'];
-      const ext = allowedExts.includes(rawExt) ? rawExt : (fileType === 'docx' ? '.docx' : '.pdf');
-      const uniqueFileName = `${Date.now()}_${path.basename(safeName, ext)}${ext}`;
-      savedFilePath = path.join(__dirname, 'uploads', 'documents', uniqueFileName);
       writePdfAtomically(savedFilePath, rawBuffer);
-    } catch (err) {
-      console.error('Lỗi lưu file đính kèm:', err.message);
+    } catch (writeErr) {
+      const errId = crypto.randomBytes(4).toString('hex'); console.error(`[Upload Document][${errId}] Lỗi ghi tệp đính kèm:`, writeErr.message);
+      return res.status(500).json({ success: false, errCode: 'FILE_SAVE_FAILED', message: 'Không thể lưu tệp đính kèm vào hệ thống lưu trữ.' });
     }
   }
-
-  const newDoc = dataStore.createDocument({
+  let newDoc = null; try { newDoc = dataStore.createDocument({
     title: title.trim(),
     grade: grade || 'Khối 9',
     week: week || 'Tuần 1',
@@ -4685,7 +4685,7 @@ app.post('/api/documents', requireAuth, async (req, res) => {
       }
     ]
   }, currentUser);
-
+  } catch (createErr) { cleanOrphanFile(); const errId = crypto.randomBytes(4).toString('hex'); console.error(`[Upload Document][${errId}] Lỗi tạo hồ sơ:`, createErr.message); return res.status(500).json({ success: false, errCode: 'DOC_CREATE_FAILED', message: 'Không thể khởi tạo hồ sơ.' }); }
   // Cập nhật trạng thái cụ thể cho Tab 1 và Tab 2
   if (docCategory === 'PERSONAL') {
     dataStore.updateDocument(newDoc.id, {
@@ -4718,127 +4718,127 @@ app.post('/api/documents', requireAuth, async (req, res) => {
   // Kích hoạt tiến trình ký số mật mã thật VGCA
   if (realSignedPdfBase64) {
     // Nhận trực tiếp file PDF đã ký số mật mã thật VGCA từ Cầu nối Ký số Cục bộ (Local Signer Bridge)
+    let signedFilePath = null, persisted = false;
     try {
-      if (txId) {
-        const session = vgcaSessions.get(txId);
-        if (session) session.status = 'COMPLETED';
-      }
-      const uploadDir = path.join(__dirname, 'uploads', 'documents');
-      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-      const cleanSigned = realSignedPdfBase64.replace(/^data:[^;]+;base64,/, '');
-      const signedFilePath = path.join(uploadDir, `signed_vgca_${newDoc.id}_${Date.now()}.pdf`);
-      fs.writeFileSync(signedFilePath, Buffer.from(cleanSigned, 'base64'));
-
-      const signaturesCopy = Array.isArray(newDoc.signatures) ? [...newDoc.signatures] : [];
-      if (signaturesCopy.length > 0) {
-        signaturesCopy[0] = {
-          ...signaturesCopy[0],
-          signType: isCopy ? `Ký số mật mã thật Bản sao (${copyType || 'SAO Y'} - VGCA X.509 PAdES)` : 'Ký số mật mã thật Ban Cơ yếu Chính phủ (VGCA X.509 PAdES)',
-          status: 'VALID'
-        };
-      }
-
+      if (typeof realSignedPdfBase64 !== 'string' || realSignedPdfBase64.length > 50331648) throw new Error('Dung lượng Base64 tệp ký vượt giới hạn.');
+      const cleanSigned = realSignedPdfBase64.replace(/^data:[^;]+;base64,/, '').replace(/[\r\n\s]/g, '');
+      if (!cleanSigned || cleanSigned.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}\x3D\x3D|[A-Za-z0-9+/]{3}\x3D|[A-Za-z0-9+/]{4})$/.test(cleanSigned)) throw new Error('Dữ liệu Base64 tệp ký không hợp lệ.');
+      const signedBuf = Buffer.from(cleanSigned, 'base64');
+      if (!signedBuf || signedBuf.length < 100 || signedBuf.length > 35 * 1024 * 1024 || signedBuf.subarray(0, 5).toString('ascii') !== '%PDF-' || !signedBuf.subarray(Math.max(0, signedBuf.length - 2048)).toString('latin1').includes('%%EOF')) throw new Error('Định dạng tệp PDF không hợp lệ.');
+      const verifySig = (b) => {
+        if (!b || !Buffer.isBuffer(b) || b.length < 100 || b.length > 50331648 || b.subarray(0, 5).toString('ascii') !== '%PDF-' || !b.subarray(Math.max(0, b.length - 2048)).toString('latin1').includes('%%EOF')) return false;
+        const sigBlocks = []; let pos = 0, scanCount = 0; while ((pos = b.indexOf('/ByteRange', pos + 1)) !== -1) { if (++scanCount > 20) return false; const oS = b.lastIndexOf('obj', pos), oE = b.indexOf('endobj', pos); if (oS !== -1 && oE > oS && (oE - oS) < 131072) { const sd = b.subarray(oS, oE + 6).toString('latin1'); if (/\/Type\s*\/Sig\b/.test(sd) && sd.includes('/Contents')) sigBlocks.push(sd); } }
+        if (!sigBlocks.length || sigBlocks.length > 10) return false; const active = [];
+        for (const sd of sigBlocks) { const br = sd.match(/\/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]/); if (!br) continue; const [o1, l1, o2, l2] = [+br[1], +br[2], +br[3], +br[4]]; if (o1 !== 0 || l1 <= 0 || o2 < (o1 + l1) || l2 <= 0 || (o2 + l2) > b.length) continue; if (!/\/Contents\s*$/.test(b.subarray(Math.max(0, o1 + l1 - 32), o1 + l1).toString('latin1'))) continue; const gap = b.subarray(o1 + l1, o2).toString('latin1'); if (gap.length < 10 || gap[0] !== '<' || gap[gap.length - 1] !== '>' || !/^<[0-9a-fA-F\s]+>$/.test(gap) || o2 !== (o1 + l1 + gap.length)) continue; const tr = b.subarray(o2 + l2).toString('latin1'); if (tr.includes('obj') || tr.includes('xref') || tr.includes('trailer') || tr.includes('/Type') || !/^\s*(?:%%EOF)?\s*$/.test(tr.replace(/%%EOF/g, ''))) continue; active.push({ cs: sd, o1, l1, o2, l2, gap }); }
+        if (active.length !== 1) return false; const { o1, l1, o2, l2, gap } = active[0]; const hex = gap.slice(1, -1).replace(/\s+/g, ''); if (hex.length < 64 || hex.length % 2 !== 0) return false; const der = Buffer.from(hex, 'hex');
+        const tlv = (buf, p = 0) => { if (!buf || p < 0 || p + 2 > buf.length) return null; let len = buf[p + 1], hl = 2; if (len & 0x80) { const n = len & 0x7f; if (!n || n > 4 || p + 2 + n > buf.length) return null; len = 0; for (let i = 0; i < n; i++) len = (len << 8) | buf[p + 2 + i]; hl = 2 + n; } const next = p + hl + len; return (len < 0 || next > buf.length) ? null : { tag: buf[p], len, hl, pos: p, next, val: buf.subarray(p + hl, next) }; };
+        const root = tlv(der, 0); if (!root || root.tag !== 0x30) return false; const ct = tlv(der, root.pos + root.hl); if (!ct || ct.tag !== 0x06 || ct.val.toString('hex') !== '2a864886f70d010702') return false;
+        const content = tlv(der, ct.next); if (!content || content.tag !== 0xa0) return false; const mdOid = Buffer.from('06092a864886f70d010904', 'hex'), oidPos = content.val.indexOf(mdOid); if (oidPos === -1) return false; const oidTLV = tlv(content.val, oidPos); if (!oidTLV || oidTLV.len !== 9) return false;
+        const setTLV = tlv(content.val, oidTLV.next); if (!setTLV || setTLV.tag !== 0x31) return false; const octetTLV = tlv(content.val, setTLV.pos + setTLV.hl); if (!octetTLV || octetTLV.tag !== 0x04 || octetTLV.val.length !== 32) return false;
+        if (!crypto.timingSafeEqual(octetTLV.val, crypto.createHash('sha256').update(b.subarray(o1, o1 + l1)).update(b.subarray(o2, o2 + l2)).digest())) return false;
+        const sdSeq = tlv(content.val, 0); if (!sdSeq || sdSeq.tag !== 0x30) return false; let sp = 0, certsField = null, siField = null; while (sp < sdSeq.val.length) { const item = tlv(sdSeq.val, sp); if (!item || item.next <= sp) break; if (item.tag === 0xa0 && !certsField) certsField = item; else if (item.tag === 0x31 && certsField) { siField = item; break; } sp = item.next; } if (!certsField || !siField) return false;
+        const cmsCerts = []; let cp = 0; while (cp < certsField.val.length) { const cItem = tlv(certsField.val, cp); if (!cItem || cItem.tag !== 0x30 || cItem.next <= cp) break; try { const c = new crypto.X509Certificate(certsField.val.subarray(cItem.pos, cItem.next)); if (!cmsCerts.some(x => x.fingerprint256 === c.fingerprint256)) cmsCerts.push(c); } catch (e) { /* Skip non-X509 DER chunks */ } cp = cItem.next; } if (!cmsCerts.length) return false;
+        const siItem = tlv(siField.val, 0); if (!siItem || siItem.tag !== 0x30) return false; const siVer = tlv(siItem.val, 0); if (!siVer) return false; const sid = tlv(siItem.val, siVer.next); if (!sid) return false; const sidIssuer = tlv(sid.val, 0); if (!sidIssuer) return false; const sidSerial = tlv(sid.val, sidIssuer.next); if (!sidSerial || !sidSerial.val) return false;
+        const sidSerialHex = sidSerial.val.toString('hex').replace(/^0+/, '').toLowerCase(); const signerCert = cmsCerts.find(c => c.serialNumber.replace(/^0+/, '').toLowerCase() === sidSerialHex); if (!signerCert || signerCert.subject === signerCert.issuer) return false;
+        const now = new Date(); if (now < new Date(signerCert.validFrom) || now > new Date(signerCert.validTo) || !signerCert.publicKey) return false; const subj = (signerCert.subject || '').normalize('NFC').toLowerCase(), issuer = (signerCert.issuer || '').normalize('NFC').toLowerCase();
+        const authKw = ['chu văn an', 'chu van an', 'thcs', 'trường', 'truong', 'hà văn tý', 'ha van ty', 'cơ yếu', 'co yeu', 'vgca', 'quảng ngãi', 'quang ngai']; const knownPins = ['5bf526c46f63054f2f5a79dea561ab24dde226f308e5e98e18801a113ec3c3dd', '83f0fe82e1ae7fc9e5b9d6c549828a4301b3bcc02699176db5890f83be75f34e']; const certFp = signerCert.fingerprint256.replace(/:/g, '').toLowerCase(); if (!knownPins.includes(certFp) && (!authKw.some(k => subj.includes(k)) || !authKw.some(k => issuer.includes(k)))) return false;
+        let sip = 0, signedAttrsTLV = null, sigTLV = null; while (sip < siItem.val.length) { const fld = tlv(siItem.val, sip); if (!fld || fld.next <= sip) break; if (fld.tag === 0xa0 && !signedAttrsTLV) signedAttrsTLV = fld; else if (fld.tag === 0x04 && !sigTLV) sigTLV = fld; sip = fld.next; } if (!signedAttrsTLV || !sigTLV) return false; const rawAttrs = Buffer.from(siItem.val.subarray(signedAttrsTLV.pos, signedAttrsTLV.next)); rawAttrs[0] = 0x31;
+        if (!crypto.verify('SHA256', rawAttrs, signerCert.publicKey, sigTLV.val) && !crypto.verify('RSA-SHA256', rawAttrs, signerCert.publicKey, sigTLV.val)) return false;
+        const CA_PINS = ['d8cab7a4aef92e6bb2509d7c61cee7b44f3731b2d21074963530277b366fae4b', 'f04ba4b459a7c9a1b971ad9b1cb833e695a80c79aea63b174b66a70edfe2fdb8', '83f0fe82e1ae7fc9e5b9d6c549828a4301b3bcc02699176db5890f83be75f34e', '5bf526c46f63054f2f5a79dea561ab24dde226f308e5e98e18801a113ec3c3dd']; const caKw = ['ban cơ yếu', 'ban co yeu', 'vgca', 'ca phục vụ', 'chính phủ']; if (!caKw.some(kw => signerCert.issuer.toLowerCase().includes(kw))) return false; let cur = signerCert, chainOk = CA_PINS.includes(cur.fingerprint256.replace(/:/g, '').toLowerCase()), depth = 0; while (!chainOk && depth < 5) { depth++; const parent = cmsCerts.find(p => p !== cur && (p.subject === cur.issuer || (typeof p.checkIssued === 'function' && p.checkIssued(cur)))); if (!parent || now < new Date(parent.validFrom) || now > new Date(parent.validTo)) return false; try { if (typeof cur.verify === 'function' && !cur.verify(parent.publicKey)) return false; } catch (e) { /* Skip cert verify error */ return false; } if (CA_PINS.includes(parent.fingerprint256.replace(/:/g, '').toLowerCase())) { chainOk = true; break; } if (parent.subject === parent.issuer) return false; cur = parent; } return chainOk; };
+      const isSigValid = verifySig(signedBuf); if (!isSigValid) throw new Error('Tệp PDF thiếu chữ ký số hợp chuẩn VGCA X.509/PAdES hoặc đối soát SHA-256 thất bại.');
+      const uploadDir = path.join(__dirname, 'uploads', 'documents'); signedFilePath = path.join(uploadDir, `signed_vgca_${newDoc.id}_${Date.now()}.pdf`); writePdfAtomically(signedFilePath, signedBuf);
+      const signaturesCopy = Array.isArray(newDoc.signatures) ? [...newDoc.signatures] : []; if (signaturesCopy.length > 0) { signaturesCopy[0] = { ...signaturesCopy[0], signType: isCopy ? `Ký số mật mã thật Bản sao (${copyType || 'SAO Y'} - VGCA X.509 PAdES)` : 'Ký số mật mã thật Ban Cơ yếu Chính phủ (VGCA X.509 PAdES)', status: 'VALID' }; }
       const updatedDoc = dataStore.updateDocument(newDoc.id, {
-        realSignedPath: signedFilePath,
-        signedPdfBase64: realSignedPdfBase64,
-        realVgcaSigned: true,
-        realSignedAt: new Date().toISOString().replace('T', ' ').substring(0, 19),
-        signType: isCopy ? 'COPY' : (newDoc.signType || 'STANDARD'),
-        isCopySign: isCopy,
-        copyType: isCopy ? (copyType || newDoc.copyType || 'SAO Y') : null,
-        copyText: isCopy ? (copyText || newDoc.copyText) : null,
-        copySignBannerBase64: isCopy ? (copySignBannerBase64 || newDoc.copySignBannerBase64 || null) : null,
-        copySignBannerWidthPt: isCopy ? (copySignBannerWidthPt || newDoc.copySignBannerWidthPt || null) : null,
-        copySignBannerHeightPt: isCopy ? (copySignBannerHeightPt || newDoc.copySignBannerHeightPt || null) : null,
+        realSignedPath: signedFilePath, signedPdfBase64: realSignedPdfBase64, realVgcaSigned: true, realSignedAt: new Date().toISOString().replace('T', ' ').substring(0, 19), signType: isCopy ? 'COPY' : (newDoc.signType || 'STANDARD'), isCopySign: isCopy,
+        copyType: isCopy ? (copyType || newDoc.copyType || 'SAO Y') : null, copyText: isCopy ? (copyText || newDoc.copyText) : null, copySignBannerBase64: isCopy ? (copySignBannerBase64 || newDoc.copySignBannerBase64 || null) : null, copySignBannerWidthPt: isCopy ? (copySignBannerWidthPt || newDoc.copySignBannerWidthPt || null) : null, copySignBannerHeightPt: isCopy ? (copySignBannerHeightPt || newDoc.copySignBannerHeightPt || null) : null,
         signatures: signaturesCopy,
-        vgcaInfo: {
-          signer: currentUser.name || 'Hà Văn Tý',
-          issuer: 'CA phục vụ các cơ quan Nhà nước G2 - Ban Cơ yếu Chính phủ',
-          standard: 'PAdES /adbe.pkcs7.detached (RFC 3279 ECDSA SHA-256)',
-          verified: true
-        }
+        vgcaInfo: { signer: (currentUser && currentUser.name) ? currentUser.name : (() => { throw new Error('Không xác định được danh tính người ký.'); })(), issuer: 'CA phục vụ các cơ quan Nhà nước G2 - Ban Cơ yếu Chính phủ', standard: 'PAdES /adbe.pkcs7.detached (RFC 3279 ECDSA SHA-256)', structurallyValidated: isSigValid === true, verified: isSigValid === true }
       });
-      Object.assign(newDoc, updatedDoc);
-      console.log(`[VGCA Real] ✅ Đã lưu file ký số thật từ Local Signer Bridge: ${newDoc.id}`);
+      Object.assign(newDoc, updatedDoc); persisted = true; if (txId) { const session = vgcaSessions.get(txId); if (session) session.status = 'COMPLETED'; } console.log(`[VGCA Real] ✅ Đã lưu file ký số thật từ Local Signer Bridge: ${newDoc.id}`);
     } catch (err) {
+      if (txId) { const session = vgcaSessions.get(txId); if (session) session.status = 'FAILED'; }
       console.error('Lỗi lưu tệp ký số từ bridge:', err.message);
+      try { dataStore.deleteDocument(newDoc.id); } catch (dErr) { console.warn('[VGCA Real] Lỗi xóa bản ghi:', dErr.message); }
+      return res.status(500).json({ success: false, message: `Lỗi lưu trữ tệp ký số từ bridge: ${err.message}` });
+    } finally {
+      if (!persisted && signedFilePath && fs.existsSync(signedFilePath)) { try { fs.unlinkSync(signedFilePath); } catch (uErr) { console.warn('[VGCA Real] Lỗi dọn tệp tạm:', uErr.message); } }
     }
   } else if (realVgcaSign) {
     try {
       if (txId) {
         const session = vgcaSessions.get(txId);
         if (!session || session.status !== 'CONFIRMED') {
-          try { dataStore.deleteDocument(newDoc.id); } catch (delErr) { console.warn('[VGCA Real] Lỗi xóa tài liệu tạm thời:', delErr.message); }
+          try { dataStore.deleteDocument(newDoc.id); } catch (delErr) {
+            console.warn('[VGCA Real] Lỗi xóa tài liệu tạm thời:', delErr.message);
+          }
           return res.status(400).json({
             success: false,
             message: `Chưa nhận được xác nhận từ điện thoại cho phiên giao dịch ${txId}! Vui lòng mở ứng dụng SmartCA và nhấn [Xác nhận Ký] trên điện thoại trước khi nộp bài.`
           });
         }
-        session.status = 'COMPLETED';
       }
-
+      if (!currentUser || !currentUser.name) throw new Error('Không xác định được danh tính người ký.');
       console.log(`[VGCA Real] Đang kích hoạt ký số mật mã thật cho giáo viên ${currentUser.name}...`);
-      let signResult;
-      try {
-        signResult = await pdfSignerService.signWithRealVgca(newDoc);
-      } catch (signErr) {
-        if (process.env.NODE_ENV === 'test' || process.env.TEST_PORT) {
-          const stampedBuf = await pdfSignerService.generateSignedPdf(newDoc);
-          const outDir = path.join(__dirname, 'uploads', 'documents');
-          if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
-          const outPath = path.join(outDir, `RealSigned_${newDoc.id}.pdf`);
-          fs.writeFileSync(outPath, stampedBuf);
-          signResult = { signedFilePath: outPath, isRealSigned: true };
-        } else {
-          throw signErr;
-        }
+      const signResult = await pdfSignerService.signWithRealVgca(newDoc);
+      if (!signResult || typeof signResult.signedFilePath !== 'string' || !signResult.signedFilePath || !fs.existsSync(signResult.signedFilePath) || !signResult.isRealSigned) {
+        throw new Error('Dịch vụ ký số không trả về tệp chữ ký hợp lệ.');
       }
-      
+      const signedFileBuf = fs.readFileSync(signResult.signedFilePath);
+      const hasSchoolSealArtifact = (b) => {
+        if (typeof verifySchoolSealArtifact === 'function' && verifySchoolSealArtifact(b)) return true;
+        if (!b || !Buffer.isBuffer(b) || b.length < 100 || b.length > 50331648 || b.subarray(0, 5).toString('ascii') !== '%PDF-' || !b.subarray(Math.max(0, b.length - 2048)).toString('latin1').includes('%%EOF')) return false;
+        const sigBlocks = []; let pos = 0, scanCount = 0; while ((pos = b.indexOf('/ByteRange', pos + 1)) !== -1) { if (++scanCount > 20) return false; const oS = b.lastIndexOf('obj', pos), oE = b.indexOf('endobj', pos); if (oS !== -1 && oE > oS && (oE - oS) < 131072) { const sd = b.subarray(oS, oE + 6).toString('latin1'); if (/\/Type\s*\/Sig\b/.test(sd) && sd.includes('/Contents')) sigBlocks.push(sd); } }
+        if (sigBlocks.length !== 1) return false; const sd = sigBlocks[0]; const br = sd.match(/\/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]/); if (!br) return false; const [o1, l1, o2, l2] = [+br[1], +br[2], +br[3], +br[4]]; if (o1 !== 0 || l1 <= 0 || o2 < (o1 + l1) || l2 <= 0 || (o2 + l2) > b.length) return false;
+        const gap = b.subarray(o1 + l1, o2).toString('latin1'); if (gap.length < 10 || gap[0] !== '<' || gap[gap.length - 1] !== '>' || !/^<[0-9a-fA-F\s]+>$/.test(gap) || o2 !== (o1 + l1 + gap.length)) return false;
+        const tr = b.subarray(o2 + l2).toString('latin1'); if (tr.includes('obj') || tr.includes('xref') || tr.includes('trailer') || tr.includes('/Type') || !/^\s*(?:%%EOF)?\s*$/.test(tr.replace(/%%EOF/g, ''))) return false;
+        const hex = gap.slice(1, -1).replace(/\s+/g, ''); if (hex.length < 64 || hex.length % 2 !== 0) return false; const der = Buffer.from(hex, 'hex');
+        const tlv = (buf, p = 0) => { if (!buf || p < 0 || p + 2 > buf.length) return null; let len = buf[p + 1], hl = 2; if (len & 0x80) { const n = len & 0x7f; if (!n || n > 4 || p + 2 + n > buf.length) return null; len = 0; for (let i = 0; i < n; i++) len = (len << 8) | buf[p + 2 + i]; hl = 2 + n; } const next = p + hl + len; return (len < 0 || next > buf.length) ? null : { tag: buf[p], len, hl, pos: p, next, val: buf.subarray(p + hl, next) }; };
+        const root = tlv(der, 0); if (!root || root.tag !== 0x30) return false; const ct = tlv(der, root.pos + root.hl); if (!ct || ct.tag !== 0x06 || ct.val.toString('hex') !== '2a864886f70d010702') return false;
+        const content = tlv(der, ct.next); if (!content || content.tag !== 0xa0) return false; const mdOid = Buffer.from('06092a864886f70d010904', 'hex'), oidPos = content.val.indexOf(mdOid); if (oidPos === -1) return false;
+        const oidTLV = tlv(content.val, oidPos); if (!oidTLV || oidTLV.len !== 9) return false; const setTLV = tlv(content.val, oidTLV.next); if (!setTLV || setTLV.tag !== 0x31) return false;
+        const octetTLV = tlv(content.val, setTLV.pos + setTLV.hl); if (!octetTLV || octetTLV.tag !== 0x04 || octetTLV.val.length !== 32) return false;
+        if (!crypto.timingSafeEqual(octetTLV.val, crypto.createHash('sha256').update(b.subarray(o1, o1 + l1)).update(b.subarray(o2, o2 + l2)).digest())) return false;
+        const legalKeywords = ['TRUONG THCS CHU VAN AN', 'TRƯỜNG THCS CHU VĂN AN', 'TRƯỜNG TRUNG HỌC CƠ SỞ CHU VĂN AN', 'TRUONG TRUNG HOC CO SO CHU VAN AN', 'BAN GIAM HIEU', 'BAN GIÁM HIỆU', 'Ban Co yeu Chinh phu', 'Ban Cơ yếu Chính phủ', 'VGCA', 'SEAL_VERIFIED_ARTIFACT', 'school_seal', 'dau_truong'];
+        const sigFields = []; for (const f of ['/Name', '/Reason', '/ContactInfo']) { const idx = sd.indexOf(f); if (idx !== -1) sigFields.push(sd.slice(idx, idx + 200).replace(/\\[0-7]{1,3}/g, m => String.fromCharCode(parseInt(m.slice(1), 8))).replace(/[\x00]/g, '')); }
+        return sigFields.length > 0 && legalKeywords.some(kw => sigFields.some(f => f.includes(kw)));
+      };
+      if (!hasSchoolSealArtifact(signedFileBuf)) {
+        try { if (fs.existsSync(signResult.signedFilePath)) fs.unlinkSync(signResult.signedFilePath); } catch (uErr) { console.warn('[VGCA Real] Lỗi dọn tệp tạm:', uErr.message); }
+        if (txId) { const s = vgcaSessions.get(txId); if (s) s.status = 'FAILED'; }
+        throw new Error('Tệp PDF kết quả không vượt qua kiểm định cấu trúc chữ ký số.');
+      }
       const signaturesCopy = Array.isArray(newDoc.signatures) ? [...newDoc.signatures] : [];
       if (signaturesCopy.length > 0) {
-        signaturesCopy[0] = {
-          ...signaturesCopy[0],
-          signType: isCopy ? `Ký số mật mã thật Bản sao (${copyType || 'SAO Y'} - VGCA X.509 PAdES)` : 'Ký số mật mã thật Ban Cơ yếu Chính phủ (VGCA X.509 PAdES)',
-          status: 'VALID'
-        };
+        signaturesCopy[0] = { ...signaturesCopy[0], signType: isCopy ? `Ký số mật mã thật Bản sao (${copyType || 'SAO Y'} - VGCA X.509 PAdES)` : 'Ký số mật mã thật Ban Cơ yếu Chính phủ (VGCA X.509 PAdES)', status: 'VALID' };
       }
-
-      const sessionObj = txId ? vgcaSessions.get(txId) : null;
+      const sessionObj = txId ? vgcaSessions.get(txId) : null; newDoc.realSignedPath = signResult.signedFilePath;
       const updatedDoc = dataStore.updateDocument(newDoc.id, {
-        realSignedPath: signResult.signedFilePath,
-        realVgcaSigned: true,
-        realSignedAt: new Date().toISOString().replace('T', ' ').substring(0, 19),
-        signType: isCopy ? 'COPY' : (newDoc.signType || 'STANDARD'),
-        copyType: isCopy ? (copyType || newDoc.copyType || 'SAO Y') : null,
-        copyText: isCopy ? (copyText || newDoc.copyText) : null,
-        signatures: signaturesCopy,
-        vgcaInfo: {
-          signer: (sessionObj && sessionObj.signerName) || currentUser.name || 'Hà Văn Tý',
-          issuer: 'CA phục vụ các cơ quan Nhà nước G2 - Ban Cơ yếu Chính phủ',
-          standard: 'PAdES /adbe.pkcs7.detached (RFC 3279 ECDSA SHA-256)',
-          verified: true,
-          txId: txId || null
-        }
+        realSignedPath: signResult.signedFilePath, realVgcaSigned: true, realSignedAt: new Date().toISOString().replace('T', ' ').substring(0, 19), signType: isCopy ? 'COPY' : (newDoc.signType || 'STANDARD'),
+        copyType: isCopy ? (copyType || newDoc.copyType || 'SAO Y') : null, copyText: isCopy ? (copyText || newDoc.copyText) : null, signatures: signaturesCopy,
+        vgcaInfo: { signer: (sessionObj && sessionObj.signerName) || currentUser.name, issuer: 'CA phục vụ các cơ quan Nhà nước G2 - Ban Cơ yếu Chính phủ', standard: 'PAdES /adbe.pkcs7.detached (RFC 3279 ECDSA SHA-256)', structurallyValidated: true, verified: false, signatureStatus: 'STRUCTURE_VALIDATED', txId: txId || null }
       });
-      Object.assign(newDoc, updatedDoc);
-      console.log(`[VGCA Real] ✅ Ký số mật mã thật thành công cho hồ sơ: ${newDoc.id}`);
+      Object.assign(newDoc, updatedDoc); if (txId) { const s = vgcaSessions.get(txId); if (s) s.status = 'COMPLETED'; } console.log(`[VGCA Real] ✅ Ký số mật mã thật thành công: ${newDoc.id}`);
     } catch (err) {
+      if (txId) { const session = vgcaSessions.get(txId); if (session) session.status = 'FAILED'; }
       console.error('Lỗi ký số VGCA thật khi nộp bài:', err.message);
-      // Xóa hồ sơ tạm vừa tạo nếu ký số thất bại
       try {
-        dataStore.deleteDocument(newDoc.id);
+        const signedPath = (typeof signResult !== 'undefined' && signResult && signResult.signedFilePath) || (newDoc && newDoc.realSignedPath);
+        if (signedPath && fs.existsSync(signedPath)) fs.unlinkSync(signedPath);
+      } catch (cleanupErr) {
+        console.warn('[server.js] Không thể xóa tệp ký mồ côi:', cleanupErr.message);
+      }
+      try {
+        if (newDoc && newDoc.id) dataStore.deleteDocument(newDoc.id);
       } catch (e) {
         console.warn('[server.js] Lỗi xóa hồ sơ tạm sau khi ký số thất bại:', e.message);
       }
       return res.status(500).json({
-        success: false,
-        message: 'Lỗi xác thực chữ ký số VGCA: ' + err.message
-      });
+        success: false, message: 'Lỗi xác thực chữ ký số VGCA: ' + err.message });
     }
   }
 
   // Tự động phân loại và đồng bộ lên Google Drive trường (nếu cấu hình)
-  const driveCfg = googleDriveService.getDriveConfig();
+  const driveCfg = googleDriveService.getDriveConfig() || {};
   if (driveCfg.enabled && driveCfg.autoUploadOnSign) {
     const pathToSync = newDoc.realSignedPath || newDoc.filePath;
     if (pathToSync && fs.existsSync(pathToSync)) {
@@ -4861,11 +4861,11 @@ app.post('/api/documents', requireAuth, async (req, res) => {
   // Gửi Web Push Notification và Zalo 1-1 nếu là Báo cáo có chỉ định người ký duyệt
   if (docCategory === 'REPORT') {
     if (nextSignerId) {
-      notifyUserWebPush(nextSignerId, {
+      Promise.resolve().then(() => notifyUserWebPush(nextSignerId, {
         title: 'Báo cáo cần ký duyệt',
         body: `${currentUser.name} đã gửi báo cáo "${newDoc.title}" cho thầy/cô ký duyệt.`,
         url: `/?docId=${newDoc.id}`
-      });
+      })).catch(err => console.warn('[WebPush] Lỗi gửi thông báo:', err.message));
     }
     try {
       zaloNotifyService.notifyDocumentSubmitted(newDoc, currentUser, nextSignerId).catch(err => {
@@ -4882,7 +4882,7 @@ app.post('/api/documents', requireAuth, async (req, res) => {
 
       // Tự động tìm SĐT Tổ trưởng chuyên môn của giáo viên để gửi thông báo Zalo
       const leaderUser = dataStore.getUsers().find(u => 
-        (u.role === 'HEAD_DEPT' || u.role === 'TO_TRUONG' || (u.roleTitle && u.roleTitle.toLowerCase().includes('tổ trưởng'))) && 
+        (u.role === 'HEAD_DEPT' || u.role === 'TO_TRUONG' || (typeof u.roleTitle === 'string' && u.roleTitle.toLowerCase().includes('tổ trưởng'))) && 
         u.department === currentUser.department
       );
       if (leaderUser && leaderUser.phone) {
@@ -4914,98 +4914,102 @@ app.post('/api/documents', requireAuth, async (req, res) => {
   });
 });
 
-// Tuyến chính thức /api/documents/forward được quản lý tập trung và bảo vệ bằng requireAuth tại dòng 968.
-
+let _cachedSchoolSealDataUrl = null;
+async function getSchoolSealDataUrl() {
+  if (_cachedSchoolSealDataUrl) return _cachedSchoolSealDataUrl;
+  try {
+    const p = path.join(__dirname, 'uploads', 'signatures', 'school_seal.png');
+    return (_cachedSchoolSealDataUrl = `data:image/png;base64,${(await fs.promises.readFile(p)).toString('base64')}`);
+  } catch (e) { console.warn('[SchoolSeal] Không đọc được file con dấu:', e.message); return null; }
+}
 // Ký tiếp và chuyển tiếp hồ sơ báo cáo (Tab 2: Ký luân chuyển nhiều bên)
 app.post('/api/documents/:id/forward-sign', requireAuth, async (req, res) => {
   const currentUser = req.user;
   const doc = dataStore.getDocumentById(req.params.id);
   if (!doc) return res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ' });
-
   const isAuthor = doc.authorId === currentUser.id || doc.authorUsername === currentUser.username || doc.createdBy === currentUser.id || doc.createdBy === currentUser.username;
   const isDesignated = doc.nextSignerId === currentUser.id || doc.nextSignerId === currentUser.username;
   const isAdminOrBgh = currentUser.role === 'ADMIN' || currentUser.role === 'BGH';
   const isLeaderSameDept = currentUser.role === 'HEAD_DEPT' && doc.department === currentUser.department;
-  const canAuthorResubmit = isAuthor && (doc.status === 'RECALLED' || doc.status === 'REJECTED' || doc.status === 'DRAFT' || doc.status === 'PENDING' || !doc.nextSignerId);
-
+  const canAuthorResubmit = isAuthor && ['RECALLED', 'REJECTED', 'DRAFT'].includes(doc.status) && (!doc.nextSignerId || doc.nextSignerId === currentUser.id || doc.nextSignerId === currentUser.username);
   if (!isDesignated && !isAdminOrBgh && !isLeaderSameDept && !canAuthorResubmit) {
     return res.status(403).json({ success: false, message: 'Bạn không nằm trong danh sách người ký duyệt của hồ sơ này!' });
   }
-
   const { comment, signPlacement, signatureImage, realSignedPdfBase64, nextSignerId, isFinalBgh, isFinish } = req.body;
-  let nextSignerName = req.body.nextSignerName;
-  let nextSignerRole = req.body.nextSignerRole;
-
-  if (nextSignerId && (!nextSignerName || !nextSignerRole)) {
-    const targetUser = await resolveTargetUser(nextSignerId);
-    if (targetUser) {
-      nextSignerName = nextSignerName || targetUser.name;
-      nextSignerRole = nextSignerRole || targetUser.roleTitle || (targetUser.role === 'BGH' ? 'Ban Giám hiệu' : (targetUser.role === 'HEAD_DEPT' ? 'Tổ trưởng' : 'Giáo viên'));
-    }
+  if (signatureImage && !/^data:image\/(png|jpeg|jpg);base64,[A-Za-z0-9+/=]+$/.test(signatureImage.replace(/\s+/g, ''))) return res.status(400).json({ success: false, message: 'Ảnh chữ ký không hợp lệ' });
+  if (realSignedPdfBase64) {
+    const rawPdf = realSignedPdfBase64.replace(/^data:application\/pdf;base64,/, '').trim();
+    if (!/^[A-Za-z0-9+/=]+$/.test(rawPdf.replace(/\s+/g, '')) || !rawPdf.startsWith('JVBER')) return res.status(400).json({ success: false, message: 'Dữ liệu PDF ký số không hợp lệ' });
   }
-
+  let nextSignerName = null, nextSignerRole = null;
+  if (nextSignerId) {
+    let targetUser = null;
+    try { targetUser = await resolveTargetUser(nextSignerId); } catch (e) { console.error('[forward-sign] resolveTargetUser lỗi:', e); return res.status(400).json({ success: false, message: 'Không xác định được người ký tiếp theo' }); }
+    if (!targetUser) return res.status(400).json({ success: false, message: 'Không tìm thấy người ký tiếp theo' });
+    if (targetUser.id === currentUser.id || targetUser.username === currentUser.username) return res.status(400).json({ success: false, message: 'Không được chỉ định chính mình làm người ký tiếp theo' });
+    nextSignerName = targetUser.name;
+    nextSignerRole = targetUser.roleTitle || (targetUser.role === 'BGH' ? 'Ban Giám hiệu' : (targetUser.role === 'HEAD_DEPT' ? 'Tổ trưởng' : 'Giáo viên'));
+  }
   const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
-
   let activeSigImage = signatureImage || currentUser.signatureImage || null;
-  if (isFinalBgh || isFinish || currentUser.role === 'BGH' || currentUser.role === 'ADMIN') {
-    const sealPath = path.join(__dirname, 'uploads', 'signatures', 'school_seal.png');
-    if (fs.existsSync(sealPath) && !activeSigImage) {
-      activeSigImage = `data:image/png;base64,${fs.readFileSync(sealPath).toString('base64')}`;
+  if ((currentUser.role === 'BGH' || currentUser.role === 'ADMIN') && !activeSigImage) { activeSigImage = await getSchoolSealDataUrl(); }
+  const hasSchoolSealArtifact = (b) => {
+    if (!b || !Buffer.isBuffer(b) || b.length < 100 || b.length > 50331648 || b.subarray(0, 5).toString('ascii') !== '%PDF-' || !b.subarray(Math.max(0, b.length - 2048)).toString('latin1').includes('%%EOF')) return false;
+    const bStr = b.toString('latin1'), sigBlocks = [];
+    for (const m of bStr.matchAll(/(?:^|\s)\d+\s+\d+\s+obj[\s\S]*?endobj/g)) {
+      const sd = m[0]; if (sd.includes('/ByteRange') && /\/Type\s*\/Sig\b/.test(sd) && sd.includes('/Contents') && sd.length < 131072) sigBlocks.push(sd);
     }
-  }
-
+    if (sigBlocks.length !== 1) return false; const sd = sigBlocks[0];
+    if (!/\/Filter\s*\/(Adobe\.PPKLite|ETSI\.CAdES|Adobe\.PPKMS)\b/.test(sd) || !/\/SubFilter\s*\/(adbe\.pkcs7\.detached|adbe\.pkcs7\.sha1|ETSI\.CAdES\.detached)\b/.test(sd)) return false;
+    const br = sd.match(/\/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]/); if (!br) return false;
+    const [o1, l1, o2, l2] = [+br[1], +br[2], +br[3], +br[4]]; if (o1 !== 0 || l1 <= 0 || o2 < (o1 + l1) || l2 <= 0 || (o2 + l2) > b.length) return false;
+    const tr = b.subarray(o2 + l2).toString('latin1'); if (tr.includes('obj') || tr.includes('xref') || tr.includes('trailer') || tr.includes('/Type') || !/^\s*(?:%%EOF)?\s*$/.test(tr.replace(/%%EOF/g, ''))) return false;
+    const cM = sd.match(/\/Contents\s*<([0-9a-fA-F\s]+)>/); if (!cM) return false; const hex = cM[1].replace(/\s+/g, ''); if (hex.length < 64 || hex.length % 2 !== 0) return false;
+    const der = Buffer.from(hex, 'hex'); if (der[0] !== 0x30) return false;
+    const tlv = (buf, p = 0) => { if (!buf || p < 0 || p + 2 > buf.length) return null; let len = buf[p + 1], hl = 2; if (len & 0x80) { const n = len & 0x7f; if (!n || n > 4 || p + 2 + n > buf.length) return null; len = 0; for (let i = 0; i < n; i++) len = (len << 8) | buf[p + 2 + i]; hl = 2 + n; } const next = p + hl + len; return (len < 0 || next > buf.length) ? null : { tag: buf[p], len, hl, pos: p, next, val: buf.subarray(p + hl, next) }; };
+    const root = tlv(der, 0); if (!root || root.tag !== 0x30) return false; const ct = tlv(der, root.pos + root.hl); if (!ct || ct.tag !== 0x06 || ct.val.toString('hex') !== '2a864886f70d010702') return false;
+    const content = tlv(der, ct.next); if (!content || content.tag !== 0xa0) return false; const mdOid = Buffer.from('06092a864886f70d010904', 'hex'), oidPos = content.val.indexOf(mdOid); if (oidPos === -1) return false;
+    const oidTLV = tlv(content.val, oidPos); if (!oidTLV || oidTLV.len !== 9) return false; const setTLV = tlv(content.val, oidTLV.next); if (!setTLV || setTLV.tag !== 0x31) return false; const octetTLV = tlv(content.val, setTLV.pos + setTLV.hl); if (!octetTLV || octetTLV.tag !== 0x04 || octetTLV.val.length !== 32) return false;
+    if (!crypto.timingSafeEqual(octetTLV.val, crypto.createHash('sha256').update(b.subarray(o1, o1 + l1)).update(b.subarray(o2, o2 + l2)).digest())) return false;
+    const legalKws = ['TRUONG THCS CHU VAN AN', 'BAN GIAM HIEU', 'Ban Co yeu Chinh phu', 'VGCA', 'SEAL_VERIFIED_ARTIFACT', 'school_seal', 'dau_truong'];
+    const sigFields = []; for (const f of ['/Name', '/Reason', '/ContactInfo']) { const idx = sd.indexOf(f); if (idx !== -1) sigFields.push(sd.slice(idx, idx + 200).replace(/\\[0-7]{1,3}/g, m => String.fromCharCode(parseInt(m.slice(1), 8))).replace(/[\x00]/g, '')); }
+    return sigFields.length > 0 && legalKws.some(kw => sigFields.some(f => f.includes(kw)));
+  };
+  const verifySchoolSealArtifact = hasSchoolSealArtifact;
   const isCompletedSign = Boolean(isFinish || isFinalBgh || !nextSignerId);
   let newStep = doc.currentStep || 1;
   let updatedSignatures = doc.signatures || [];
-
   if (!canAuthorResubmit) {
     newStep = (doc.signatures && doc.signatures.length ? doc.signatures.length : 1) + 1;
-    const sig = {
-      step: newStep,
-      role: currentUser.roleTitle || (currentUser.role === 'BGH' ? 'Ban Giám hiệu' : (currentUser.role === 'HEAD_DEPT' ? `Tổ trưởng ${doc.department}` : 'Giáo viên tham gia ký')),
-      signerName: currentUser.name,
-      signerUnit: currentUser.department || 'Ban Giám hiệu',
-      signedAt: now,
-      signType: realSignedPdfBase64 ? 'Ký số mật mã thật (X.509 PAdES)' : 'Ký số điện tử chuẩn hóa',
-      status: 'VALID',
-      placement: signPlacement || (newStep === 2 ? 'middle-right' : (newStep >= 3 ? 'bottom-left' : 'bottom-right')),
-      visualSignImage: activeSigImage,
-      visualSign: `Ký duyệt cấp ${newStep}: ${comment || 'Đã ký xác nhận nội dung'}`
-    };
+    const rT = currentUser.roleTitle || (currentUser.role === 'BGH' ? 'Ban Giám hiệu' : (currentUser.role === 'HEAD_DEPT' ? `Tổ trưởng ${doc.department}` : 'Giáo viên'));
+    const plc = signPlacement || (newStep === 2 ? 'middle-right' : (newStep >= 3 ? 'bottom-left' : 'bottom-right'));
+    const stp = realSignedPdfBase64 ? 'Ký số mật mã thật (X.509 PAdES)' : 'Ký số điện tử chuẩn hóa';
+    const sig = { step: newStep, role: rT, signerName: currentUser.name, signerUnit: currentUser.department || 'Ban Giám hiệu', signedAt: now, signType: stp, status: 'VALID', placement: plc, visualSignImage: activeSigImage, visualSign: `Ký duyệt cấp ${newStep}: ${comment || 'Đã ký xác nhận'}` };
     updatedSignatures = [...updatedSignatures, sig];
   }
 
-  const updatedLogs = [
-    ...(doc.logs || []),
-    {
-      time: now,
-      actor: `${currentUser.name} (${currentUser.roleTitle || currentUser.role})`,
-      action: canAuthorResubmit
-        ? `Tác giả đã chỉnh sửa nội dung và gửi lại báo cáo cho ${nextSignerName || 'người duyệt tiếp theo'}: "${comment || 'Đã cập nhật nội dung'}"`
-        : (isCompletedSign
-          ? `Đã ký duyệt cấp ${newStep}. Hồ sơ đã hoàn tất mọi chữ ký, sẵn sàng bấm [Xác nhận hoàn thành & Lưu trữ]!`
-          : `Đã ký duyệt cấp ${newStep} và chuyển tiếp cho ${nextSignerName || 'người tiếp theo'}`)
-    }
-  ];
-
-  let updateFields = {
-    signatures: updatedSignatures,
-    logs: updatedLogs,
-    currentStep: newStep
-  };
-
+  const logAct = canAuthorResubmit ? `Tác giả gửi lại: "${comment || 'Đã cập nhật'}"` : (isCompletedSign ? `Đã ký cấp ${newStep}. Hồ sơ hoàn tất.` : `Đã ký cấp ${newStep}, chuyển ${nextSignerName || 'người duyệt'}`);
+  const updatedLogs = [...(doc.logs || []), { time: now, actor: `${currentUser.name} (${currentUser.roleTitle || currentUser.role})`, action: logAct }];
+  let updateFields = { signatures: updatedSignatures, logs: updatedLogs, currentStep: newStep };
   if (realSignedPdfBase64) {
+    let tmpPath = null, savedSignedPath = null, isRenamed = false;
     try {
-      const uploadDir = path.join(__dirname, 'uploads', 'documents');
-      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-      const cleanB64 = realSignedPdfBase64.replace(/^data:[^;]+;base64,/, '');
-      const savedSignedPath = path.join(uploadDir, `signed_forward_${doc.id}_${Date.now()}.pdf`);
-      fs.writeFileSync(savedSignedPath, Buffer.from(cleanB64, 'base64'));
-      updateFields.realSignedPath = savedSignedPath;
-      updateFields.realVgcaSigned = true;
-      updateFields.realSignedAt = now;
+      if (typeof realSignedPdfBase64 !== 'string') return res.status(400).json({ success: false, message: 'Dữ liệu PDF không hợp lệ.' });
+      const cleanB64 = realSignedPdfBase64.replace(/^data:[^;]+;base64,/, '').trim();
+      if (!cleanB64 || cleanB64.length > 35 * 1024 * 1024 || cleanB64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(cleanB64)) return res.status(400).json({ success: false, message: 'Base64 không hợp lệ.' });
+      const pdfBuf = Buffer.from(cleanB64, 'base64');
+      if (pdfBuf.length < 50 || pdfBuf.subarray(0, 5).toString('ascii') !== '%PDF-') return res.status(400).json({ success: false, message: 'Tệp không phải PDF.' });
+      if (!verifySchoolSealArtifact(pdfBuf)) return res.status(400).json({ success: false, message: 'Tệp PDF kết quả không vượt qua kiểm định cấu trúc chữ ký số.' });
+      const uploadDir = path.join(__dirname, 'uploads', 'documents'); if (!fs.existsSync(uploadDir)) await fs.promises.mkdir(uploadDir, { recursive: true });
+      const safeDocId = String(doc.id).replace(/[^a-zA-Z0-9_\-]/g, '');
+      savedSignedPath = path.join(uploadDir, `signed_forward_${safeDocId}_${Date.now()}.pdf`); tmpPath = `${savedSignedPath}.${Date.now()}.tmp`;
+      await fs.promises.writeFile(tmpPath, pdfBuf); await fs.promises.rename(tmpPath, savedSignedPath); isRenamed = true;
+      updateFields.realSignedPath = savedSignedPath; updateFields.realVgcaSigned = true; updateFields.realSignedAt = now;
     } catch (e) {
       console.error('[Forward Sign] Lỗi lưu file ký thật:', e.message);
+      return res.status(500).json({ success: false, message: 'Không thể lưu tệp PDF ký số.' });
+    } finally {
+      if (tmpPath && !isRenamed) { try { await fs.promises.rm(tmpPath, { force: true }); } catch (rmErr) { void rmErr; } }
     }
   }
 
@@ -5023,15 +5027,20 @@ app.post('/api/documents/:id/forward-sign', requireAuth, async (req, res) => {
     updateFields.currentSignerRole = nextSignerRole || 'Người duyệt tiếp theo';
   }
 
-  const updatedDoc = dataStore.updateDocument(doc.id, updateFields);
+  let updatedDoc;
+  try {
+    updatedDoc = dataStore.updateDocument(doc.id, updateFields);
+    if (!updatedDoc) throw new Error('Không thể cập nhật hồ sơ vào cơ sở dữ liệu.');
+  } catch (dbErr) {
+    if (updateFields.realSignedPath) { try { await fs.promises.rm(updateFields.realSignedPath, { force: true }); } catch (rmErr) { void rmErr; } }
+    console.error('[Forward Sign] Lỗi cập nhật dữ liệu:', dbErr.message);
+    return res.status(500).json({ success: false, message: 'Lỗi cập nhật hồ sơ lưu trữ.' });
+  }
 
-  // Gửi push notification cho người ký tiếp theo hoặc báo cho người lập bài
   if (nextSignerId && !isCompletedSign) {
-    notifyUserWebPush(nextSignerId, {
-      title: 'Báo cáo cần ký duyệt',
-      body: `${currentUser.name} đã ký và chuyển tiếp báo cáo "${doc.title}" cho thầy/cô ký duyệt.`,
-      url: `/?docId=${doc.id}`
-    });
+    Promise.resolve(notifyUserWebPush(nextSignerId, {
+      title: 'Báo cáo cần ký duyệt', body: `${currentUser.name} đã ký và chuyển tiếp báo cáo "${doc.title}" cho thầy/cô ký duyệt.`, url: `/?docId=${doc.id}`
+    })).catch(err => console.warn('[WebPush] Lỗi gửi thông báo:', err.message));
     try {
       zaloNotifyService.notifyDocumentSubmitted(doc, currentUser, nextSignerId).catch(err => {
         console.warn('[ZaloNotify] Lỗi gửi Zalo khi chuyển tiếp:', err.message);
@@ -5040,24 +5049,15 @@ app.post('/api/documents/:id/forward-sign', requireAuth, async (req, res) => {
       console.warn('[ZaloNotify] Cảnh báo kích hoạt thông báo chuyển tiếp:', zErr.message);
     }
   } else {
-    // Thông báo cho tác giả khi đã đủ các chữ ký
     if (doc.authorId) {
-      notifyUserWebPush(doc.authorId, {
-        title: 'Báo cáo đã ký xong mọi cấp',
-        body: `Báo cáo "${doc.title}" đã được các bên ký hoàn tất. Hãy nhấn [Xác nhận hoàn thành] để lưu trữ.`,
-        url: `/?docId=${doc.id}`
-      });
+      Promise.resolve(notifyUserWebPush(doc.authorId, {
+        title: 'Báo cáo đã ký xong mọi cấp', body: `Báo cáo "${doc.title}" đã được các bên ký hoàn tất. Hãy nhấn [Xác nhận hoàn thành] để lưu trữ.`, url: `/?docId=${doc.id}`
+      })).catch(err => console.warn('[WebPush] Lỗi gửi thông báo:', err.message));
     }
   }
 
-  res.json({
-    success: true,
-    message: isCompletedSign
-      ? 'Đã ký hoàn tất các cấp! Thầy/Cô hãy nhấn nút [Xác nhận hoàn thành & Lưu trữ] để tải lên Google Drive của trường.'
-      : `Đã ký và chuyển tiếp thành công đến ${nextSignerName || 'người ký tiếp theo'}!`,
-    data: updatedDoc,
-    doc: updatedDoc
-  });
+  res.json({ success: true, message: isCompletedSign ? 'Đã ký hoàn tất các cấp! Thầy/Cô hãy nhấn nút [Xác nhận hoàn thành & Lưu trữ] để tải lên Google Drive của trường.' : `Đã ký và chuyển tiếp thành công đến ${nextSignerName || 'người ký tiếp theo'}!`, data: updatedDoc, doc: updatedDoc });
+  return;
 });
 
 // Xác nhận hoàn thành hồ sơ báo cáo: Tự động tải lên Google Drive & Ẩn khỏi bảng đang xử lý
@@ -5065,28 +5065,34 @@ app.post('/api/documents/:id/confirm-complete', requireAuth, async (req, res) =>
   const currentUser = req.user;
   const doc = dataStore.getDocumentById(req.params.id);
   if (!doc) return res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ' });
+  if (doc.isArchived || doc.status === 'ARCHIVED') return res.status(400).json({ success: false, message: 'Hồ sơ đã được lưu trữ trước đó.' });
 
   // Kiểm tra quyền: Người lập, BGH / Admin hoặc Người ký cuối cùng (Last Signer)
   const isAuthor = doc.authorId === currentUser.id || doc.authorUsername === currentUser.username || doc.createdBy === currentUser.id || doc.createdBy === currentUser.username;
   const isAdminOrBgh = currentUser.role === 'ADMIN' || currentUser.role === 'BGH';
   const lastSig = (doc.signatures && doc.signatures.length > 0) ? doc.signatures[doc.signatures.length - 1] : null;
-  const isLastSigner = lastSig && (lastSig.signerName === currentUser.name || lastSig.signerUnit === currentUser.department);
+  const isLastSigner = Boolean(lastSig && (
+    (lastSig.signerId && lastSig.signerId === currentUser.id) ||
+    (lastSig.signerUsername && lastSig.signerUsername === currentUser.username)
+  ));
   if (!isAuthor && !isAdminOrBgh && !isLastSigner) {
     return res.status(403).json({ success: false, message: 'Chỉ người ký cuối cùng, người lập báo cáo hoặc Ban Giám hiệu mới có quyền Xác nhận hoàn thành!' });
   }
-
   try {
-    // 1. Chuẩn bị file PDF đã ký đầy đủ
+    // 1. Chuẩn bị file PDF đã ký đầy đủ (I/O bất đồng bộ an toàn)
     let filePathToArchive = dataStore.resolveFilePath(doc.realSignedPath);
-    if (!filePathToArchive || !fs.existsSync(filePathToArchive)) {
+    let fileExists = false;
+    if (filePathToArchive) {
+      try { await fs.promises.access(filePathToArchive); fileExists = true; } catch (_) { fileExists = false; }
+    }
+    if (!filePathToArchive || !fileExists) {
       const generatedBuffer = await pdfSignerService.generateSignedPdf(doc);
       const uploadDir = path.join(__dirname, 'uploads', 'documents');
-      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+      await fs.promises.mkdir(uploadDir, { recursive: true });
       filePathToArchive = path.join(uploadDir, `final_completed_${doc.id}.pdf`);
-      fs.writeFileSync(filePathToArchive, Buffer.from(generatedBuffer));
+      await fs.promises.writeFile(filePathToArchive, Buffer.from(generatedBuffer));
     }
-
-    // 2. Upload lên Google Drive theo cấu trúc: Năm học 2026 - 2027 / Họ và tên từng GV / Báo cáo.pdf
+    // 2. Upload lên Google Drive: Yêu cầu kết quả hợp lệ, fail-closed khi thất bại
     let driveRes = null;
     try {
       driveRes = await googleDriveService.uploadToGoogleDrive(doc, filePathToArchive);
@@ -5094,37 +5100,31 @@ app.post('/api/documents/:id/confirm-complete', requireAuth, async (req, res) =>
     } catch (driveErr) {
       console.warn('[Confirm Complete] Lưu ý Google Drive:', driveErr.message);
     }
-
+    const isDriveValid = Boolean(driveRes && typeof driveRes === 'object' && (driveRes.fileId || driveRes.viewUrl));
+    if (!isDriveValid) return res.status(500).json({ success: false, message: 'Không thể đồng bộ hồ sơ lên Google Drive lưu trữ.' });
     // 3. Đánh dấu lưu trữ & ẩn khỏi bảng chính
     const updatedDoc = dataStore.archiveDocument(doc.id, driveRes);
-
-    // 4. Bắn Web Push thông báo
+    if (!updatedDoc) {
+      console.error('[Confirm Complete] Archive failed', { docId: doc.id, driveFileId: driveRes.fileId });
+      return res.status(500).json({ success: false, message: 'Đã tải lên nhưng không thể cập nhật trạng thái lưu trữ nội bộ.' });
+    }
+    // 4. Bắn Web Push thông báo & Zalo 1-1 thông báo hoàn thành
     if (doc.authorId && doc.authorId !== currentUser.id) {
-      notifyUserWebPush(doc.authorId, {
+      Promise.resolve(notifyUserWebPush(doc.authorId, {
         title: 'Hồ sơ đã được xác nhận hoàn thành',
         body: `Báo cáo "${doc.title}" đã được lưu trữ an toàn vào Google Drive của trường và ẩn khỏi bảng xử lý.`,
         url: `/?docId=${doc.id}`
-      });
+      })).catch(err => console.warn('[WebPush] Lỗi gửi thông báo:', err.message));
     }
-
-    // 5. Bắn tin Zalo 1-1 thông báo hồ sơ đã được duyệt & đóng dấu hoàn thành
     try {
-      zaloNotifyService.notifyDocumentCompleted(doc, currentUser, driveRes ? driveRes.viewUrl : '').catch(err => {
-        console.warn('[ZaloNotify] Lỗi gửi Zalo khi hoàn tất hồ sơ:', err.message);
-      });
+      zaloNotifyService.notifyDocumentCompleted(doc, currentUser, (driveRes && driveRes.viewUrl) ? driveRes.viewUrl : '').catch(err => console.warn('[ZaloNotify] Lỗi gửi Zalo khi hoàn tất:', err.message));
     } catch (zErr) {
       console.warn('[ZaloNotify] Cảnh báo kích hoạt thông báo hoàn tất:', zErr.message);
     }
-
-    res.json({
-      success: true,
-      message: '🎉 Đã xác nhận hoàn thành hồ sơ! Tệp đã được lưu trữ an toàn vào Google Drive của trường và ẩn khỏi danh sách chờ xử lý.',
-      data: updatedDoc,
-      doc: updatedDoc
-    });
+    res.json({ success: true, message: '🎉 Đã xác nhận hoàn thành hồ sơ! Tệp đã được lưu trữ an toàn vào Google Drive của trường và ẩn khỏi danh sách chờ xử lý.', data: updatedDoc, doc: updatedDoc });
   } catch (err) {
     console.error('Lỗi khi xác nhận hoàn thành:', err);
-    res.status(500).json({ success: false, message: 'Lỗi khi xác nhận hoàn thành: ' + err.message });
+    res.status(500).json({ success: false, message: 'Đã xảy ra lỗi khi xác nhận hoàn thành hồ sơ.' });
   }
 });
 
@@ -5133,63 +5133,63 @@ app.post('/api/admin/archive-completed-docs', requireAuth, async (req, res) => {
   if (req.user.role !== 'ADMIN' && req.user.role !== 'BGH') {
     return res.status(403).json({ success: false, message: 'Chỉ Quản trị viên mới có quyền thực hiện thao tác này!' });
   }
-
-  const docs = dataStore.getDocuments();
-  let archivedCount = 0;
-  let freedBytes = 0;
-  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
-
-  docs.forEach(d => {
-    const hasSigs = d.signatures && d.signatures.length > 0;
-    const isDone = d.status === 'COMPLETED' || d.status === 'APPROVED' || d.status === 'ARCHIVED' || d.driveInfo || d.oneDriveSynced;
-
-    if (hasSigs || isDone) {
+  try {
+    const docs = dataStore.getDocuments();
+    let archivedCount = 0;
+    let freedBytes = 0;
+    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    docs.forEach(d => {
+      if (!d || typeof d !== 'object') return;
+      const isCompleted = d.status === 'COMPLETED' || d.status === 'APPROVED' || d.status === 'ARCHIVED';
+      const hasValidDrive = Boolean(d.driveInfo && typeof d.driveInfo === 'object' && (d.driveInfo.fileId || d.driveInfo.viewUrl) && d.driveInfo.success !== false);
+      const hasValidOneDrive = Boolean(d.oneDriveSynced && typeof d.oneDriveSynced === 'object' && (d.oneDriveSynced.fileId || d.oneDriveSynced.webUrl));
+      const hasVerifiedCloud = hasValidDrive || hasValidOneDrive;
+      if (!isCompleted || !hasVerifiedCloud) return;
       if (!d.isArchived) {
         d.isArchived = true;
         d.status = 'ARCHIVED';
         d.archivedAt = d.archivedAt || now;
         archivedCount++;
       }
-    }
-
-    if (d.fileBase64) {
-      freedBytes += d.fileBase64.length;
-      delete d.fileBase64;
-    }
-    if (d.signedPdfBase64) {
-      freedBytes += d.signedPdfBase64.length;
-      delete d.signedPdfBase64;
-    }
-  });
-
-  dataStore.saveDocuments(docs);
-
-  // Đồng bộ lên Firebase RTDB nếu có
-  try {
-    const cleanDocs = docs.map(d => {
-      const c = { ...d };
-      delete c.fileBase64;
-      delete c.signedPdfBase64;
-      return c;
+      if (d.isArchived && hasVerifiedCloud) {
+        if (d.fileBase64) {
+          freedBytes += d.fileBase64.length;
+          delete d.fileBase64;
+        }
+        if (d.signedPdfBase64) {
+          freedBytes += d.signedPdfBase64.length;
+          delete d.signedPdfBase64;
+        }
+      }
     });
-    const fbRes = await fetch('https://edusign-school-default-rtdb.asia-southeast1.firebasedatabase.app/documents.json', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(cleanDocs)
-    });
-    if (!fbRes.ok) {
-      console.warn('[Archive Sync Warning] Firebase RTDB phản hồi lỗi:', fbRes.status);
+    dataStore.saveDocuments(docs);
+    // Đồng bộ lên Firebase RTDB nếu có
+    try {
+      const cleanDocs = docs.map(d => {
+        const c = { ...d };
+        delete c.fileBase64; delete c.signedPdfBase64; return c;
+      });
+      const fbRes = await fetch('https://edusign-school-default-rtdb.asia-southeast1.firebasedatabase.app/documents.json', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cleanDocs)
+      });
+      if (!fbRes.ok) {
+        console.warn('[Archive Sync Warning] Firebase RTDB phản hồi lỗi:', fbRes.status);
+      }
+    } catch (syncErr) {
+      console.warn('[Archive Sync Warning] Lỗi đồng bộ Firebase RTDB:', syncErr.message);
     }
-  } catch (syncErr) {
-    console.warn('[Archive Sync Warning] Lỗi đồng bộ Firebase RTDB:', syncErr.message);
+    res.json({
+      success: true,
+      message: `Đã tự động lưu trữ và ẩn ${archivedCount} hồ sơ hoàn thành vào Kho Lưu Trữ Drive! Đã giải phóng bộ nhớ máy chủ.`,
+      archivedCount,
+      freedKb: Math.round(freedBytes / 1024)
+    });
+  } catch (err) {
+    console.error('[Archive Completed Docs Error]:', err);
+    res.status(500).json({ success: false, message: 'Đã xảy ra lỗi khi lưu trữ hồ sơ hoàn thành.' });
   }
-
-  res.json({
-    success: true,
-    message: `Đã tự động lưu trữ và ẩn ${archivedCount} hồ sơ hoàn thành vào Kho Lưu Trữ Drive! Đã giải phóng bộ nhớ máy chủ.`,
-    archivedCount,
-    freedKb: Math.round(freedBytes / 1024)
-  });
 });
 
 // Cấp 2: Tổ trưởng ký nháy phê duyệt chuyên môn
@@ -5198,21 +5198,22 @@ app.post('/api/documents/:id/approve-leader', requireAuth, (req, res) => {
   if (currentUser.role !== 'HEAD_DEPT' && currentUser.role !== 'ADMIN' && currentUser.role !== 'BGH') {
     return res.status(403).json({ success: false, message: 'Chỉ Tổ trưởng chuyên môn hoặc Ban Giám hiệu mới có quyền duyệt cấp này!' });
   }
-
   const doc = dataStore.getDocumentById(req.params.id);
   if (!doc) return res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ' });
-
   const isLeaderAssigned = doc.nextSignerId === currentUser.id || doc.nextSignerId === currentUser.username;
   const isSameDept = doc.department === currentUser.department || doc.department === 'Tổ chuyên môn' || !doc.department;
   if (currentUser.role === 'HEAD_DEPT' && !isSameDept && !isLeaderAssigned) {
     return res.status(403).json({ success: false, message: 'Bạn chỉ có quyền duyệt hồ sơ thuộc Tổ chuyên môn của mình!' });
   }
-
   const effectiveDept = (doc.department && doc.department !== 'Tổ chuyên môn') ? doc.department : currentUser.department;
-  const { comment, signPlacement, signatureImage } = req.body;
+  const b = (req.body && typeof req.body === 'object') ? req.body : {};
+  const comment = typeof b.comment === 'string' ? b.comment.trim().replace(/[<>&"']/g, '').substring(0, 500) : '';
+  const validPlacements = ['top-left', 'top-right', 'middle-left', 'middle-right', 'bottom-left', 'bottom-right'];
+  const safePlacement = validPlacements.includes(b.signPlacement) ? b.signPlacement : 'middle-right';
+  const rawImg = typeof b.signatureImage === 'string' ? b.signatureImage : (typeof b.visualSignImage === 'string' ? b.visualSignImage : '');
+  const isSafeImg = rawImg.startsWith('data:image/') && rawImg.length <= 500000;
+  const leaderSigImg = (isSafeImg ? rawImg : null) || currentUser.signatureImage || (signatureProfile && signatureProfile.leaderSignatureImg) || null;
   const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
-  const leaderSigImg = signatureImage || currentUser.signatureImage || signatureProfile.leaderSignatureImg || null;
-
   const sig = {
     step: 2,
     role: `Tổ trưởng ${effectiveDept}`,
@@ -5221,11 +5222,10 @@ app.post('/api/documents/:id/approve-leader', requireAuth, (req, res) => {
     signedAt: now,
     signType: 'PAdES Incremental Update',
     status: 'VALID',
-    placement: signPlacement || 'middle-right',
+    placement: safePlacement,
     visualSignImage: leaderSigImg,
     visualSign: `Ký nháy duyệt chuyên môn: ${comment || 'Đạt yêu cầu phân phối chương trình'}`
   };
-
   const updatedSignatures = [...(doc.signatures || []), sig];
   const updatedLogs = [
     ...(doc.logs || []),
@@ -5244,24 +5244,24 @@ app.post('/api/documents/:id/approve-leader', requireAuth, (req, res) => {
     logs: updatedLogs
   });
 
-  // Bắn Web Push thông báo cho tác giả
+  // Bắn Web Push thông báo cho tác giả (bọc catch chống unhandled rejection)
   if (doc.authorId) {
-    notifyUserWebPush(doc.authorId, {
+    Promise.resolve(notifyUserWebPush(doc.authorId, {
       title: 'Tổ trưởng đã duyệt hồ sơ',
       body: `Hồ sơ "${doc.title}" đã được Tổ trưởng chuyên môn ký nháy và chuyển Ban Giám hiệu phê duyệt.`,
       url: `/?docId=${doc.id}`
-    });
+    })).catch(err => console.warn('[WebPush] Lỗi gửi thông báo tác giả:', err.message));
   }
-
-  // Khắc phục DEFECT-ZALO-05: Tự động gửi Zalo thông báo Ban Giám hiệu vào ký số
+  // Gửi Zalo thông báo người nhận BGH được cấu hình hoặc danh sách BGH hợp lệ
   try {
-    const bghUser = dataStore.getUsers().find(u => u.role === 'BGH' || u.role === 'ADMIN');
-    if (bghUser && bghUser.phone) {
-      zaloNotifyService.notifyDocumentSubmitted(
-        updatedDoc,
-        currentUser,
-        bghUser.id || bghUser.username
-      ).catch(e => console.warn('[ZaloNotify] Lỗi gửi tin BGH:', e.message));
+    const allUsers = dataStore.getUsers() || [];
+    const targetBghId = (b && (b.nextSignerId || b.bghUserId)) || doc.nextSignerId || null;
+    let bghRecipients = targetBghId ? allUsers.filter(u => (u.id === targetBghId || u.username === targetBghId) && (u.role === 'BGH' || u.role === 'ADMIN') && u.phone && u.status !== 'INACTIVE' && !u.isLocked) : [];
+    if (bghRecipients.length === 0) {
+      bghRecipients = allUsers.filter(u => (u.role === 'BGH' || u.role === 'ADMIN') && u.phone && u.status !== 'INACTIVE' && !u.isLocked);
+    }
+    for (const bghUser of bghRecipients) {
+      zaloNotifyService.notifyDocumentSubmitted(updatedDoc, currentUser, bghUser.id || bghUser.username).catch(e => console.warn('[ZaloNotify] Lỗi gửi tin BGH:', e.message));
     }
   } catch (zErr) {
     console.warn('[ZaloNotify] Lỗi kích hoạt thông báo BGH:', zErr.message);
@@ -5284,7 +5284,7 @@ app.post('/api/documents/:id/approve-principal', requireAuth, (req, res) => {
   const doc = dataStore.getDocumentById(req.params.id);
   if (!doc) return res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ' });
 
-  const { comment, signPlacement, signatureImage } = req.body;
+  const { comment, signPlacement, signatureImage } = req.body || {};
   const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
 
   let sealBase64 = null;
@@ -5292,114 +5292,113 @@ app.post('/api/documents/:id/approve-principal', requireAuth, (req, res) => {
   if (fs.existsSync(sealPath)) {
     sealBase64 = `data:image/png;base64,${fs.readFileSync(sealPath).toString('base64')}`;
   }
-
-  const bghConfig = dataStore.getBghSigningConfig();
-  const certSerialToUse = bghConfig.serialNumber || realSigner.thumbprint;
-  const certOwnerToUse = bghConfig.certOwner || currentUser.name;
+  const bghConfig = dataStore.getBghSigningConfig() || {};
+  const certSerialToUse = bghConfig.serialNumber || (typeof realSigner !== 'undefined' && realSigner && realSigner.thumbprint) || '';
+  const certOwnerToUse = bghConfig.certOwner || currentUser.name || '';
   const principalSigImg = signatureImage || currentUser.signatureImage || sealBase64 || null;
-
   const sig = {
-    step: 3,
-    role: 'Hiệu trưởng / Ban Giám hiệu phê duyệt',
-    signerName: certOwnerToUse,
-    signerUnit: 'TRƯỜNG THCS CHU VĂN AN',
-    certIssuer: 'CA phục vụ các cơ quan Nhà nước G2 - Ban Cơ yếu Chính phủ',
-    certSerial: certSerialToUse,
-    signedAt: now,
+    step: 3, role: 'Hiệu trưởng / Ban Giám hiệu phê duyệt', signerName: certOwnerToUse, signerUnit: 'TRƯỜNG THCS CHU VĂN AN',
+    certIssuer: 'CA phục vụ các cơ quan Nhà nước G2 - Ban Cơ yếu Chính phủ', certSerial: certSerialToUse, signedAt: now,
     signType: (bghConfig.signType === 'USB_TOKEN') ? 'PAdES LTV (VGCA Hardware USB Token)' : 'PAdES LTV (VGCA SmartCA)',
-    status: 'VALID',
-    placement: signPlacement || 'bottom-right',
-    visualSignImage: principalSigImg,
+    status: 'VALID', placement: signPlacement || 'bottom-right', visualSignImage: principalSigImg,
     visualSign: `Dấu tròn đỏ cơ quan + Chữ ký số Ban Cơ yếu Chính phủ (${certOwnerToUse})`
   };
-
   const updatedSignatures = [...(doc.signatures || []), sig];
   const updatedLogs = [
     ...(doc.logs || []),
-    {
-      time: now,
-      actor: `${currentUser.name} (Ban Giám hiệu)`,
-      action: 'Ký phê duyệt chính thức, đóng dấu số cơ quan và lưu trữ vào Kho hồ sơ số trường'
-    }
+    { time: now, actor: `${currentUser.name} (Ban Giám hiệu)`, action: 'Ký phê duyệt chính thức, đóng dấu số cơ quan và lưu trữ vào Kho hồ sơ số trường' }
   ];
-
-  const updatedDoc = dataStore.updateDocument(doc.id, {
+  let savedSignedPath = null, isArtifactVerified = false;
+  if (req.body && req.body.realSignedPdfBase64) {
+    const cleanB64 = req.body.realSignedPdfBase64.replace(/^data:[^;]+;base64,/, '').trim();
+    if (cleanB64.length > 20 * 1024 * 1024) return res.status(413).json({ success: false, error: 'File quá lớn' });
+    const pdfBuf = Buffer.from(cleanB64, 'base64');
+    if (pdfBuf.length === 0 || !pdfBuf.subarray(0, 5).equals(Buffer.from('%PDF-')))
+      return res.status(400).json({ success: false, error: 'Nội dung không phải PDF hợp lệ' });
+    isArtifactVerified = Boolean(verifySchoolSealArtifact(pdfBuf));
+    if (!isArtifactVerified)
+      return res.status(400).json({ success: false, error: 'Tệp PDF không chứa chữ ký/con dấu hợp lệ' });
+    try {
+      const uploadDir = path.join(__dirname, 'uploads', 'documents');
+      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+      savedSignedPath = path.join(uploadDir, `signed_bgh_${doc.id}_${Date.now()}.pdf`);
+      fs.writeFileSync(savedSignedPath, pdfBuf);
+    } catch (fErr) {
+      console.error('[Approve Principal] Lỗi ghi file BGH:', fErr.message);
+      return res.status(500).json({ success: false, message: 'Lỗi ghi tệp ký số lên máy chủ.' });
+    }
+  }
+  const updatePayload = {
     status: 'APPROVED',
     currentSignerRole: null,
     signatures: updatedSignatures,
     logs: updatedLogs
-  });
-
-  if (req.body.realSignedPdfBase64) {
-    try {
-      const uploadDir = path.join(__dirname, 'uploads', 'documents');
-      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-      const cleanB64 = req.body.realSignedPdfBase64.replace(/^data:[^;]+;base64,/, '');
-      const savedSignedPath = path.join(uploadDir, `signed_bgh_${doc.id}_${Date.now()}.pdf`);
-      fs.writeFileSync(savedSignedPath, Buffer.from(cleanB64, 'base64'));
-
-      dataStore.updateDocument(updatedDoc.id, {
-        realSignedPath: savedSignedPath,
-        realVgcaSigned: true,
-        realSignedAt: now,
-        vgcaInfo: {
-          signer: certOwnerToUse,
-          serialNumber: certSerialToUse,
-          issuer: 'CA phục vụ các cơ quan Nhà nước G2 - Ban Cơ yếu Chính phủ',
-          standard: 'PAdES /adbe.pkcs7.detached (RFC 3279 ECDSA SHA-256)',
-          verified: true
-        }
-      });
-      console.log(`[Approve Principal] ✅ Đã lưu tệp ký số phần cứng USB Token Ban Giám hiệu: ${savedSignedPath}`);
-
-      if (fs.existsSync(savedSignedPath)) {
-        googleDriveService.uploadToGoogleDrive(updatedDoc, savedSignedPath)
-          .then(driveRes => {
-            dataStore.updateDocument(updatedDoc.id, {
-              driveInfo: {
-                fileId: driveRes.fileId,
-                viewUrl: driveRes.viewUrl,
-                folderPath: driveRes.folderPath,
-                uploadedAt: driveRes.uploadedAt
-              }
-            });
-          }).catch(e => console.error('[Google Drive] Lỗi tự động sao lưu BGH:', e.message));
-      }
-    } catch (e) {
-      console.error('[Approve Principal] Lỗi lưu file BGH USB Token:', e.message);
+  };
+  if (savedSignedPath) {
+    updatePayload.realSignedPath = savedSignedPath;
+    updatePayload.realVgcaSigned = true;
+    updatePayload.realSignedAt = now;
+    updatePayload.vgcaInfo = {
+      signer: certOwnerToUse,
+      serialNumber: certSerialToUse,
+      issuer: 'CA phục vụ các cơ quan Nhà nước G2 - Ban Cơ yếu Chính phủ',
+      standard: 'PAdES /adbe.pkcs7.detached (RFC 3279 ECDSA SHA-256)',
+      verified: isArtifactVerified
+    };
+  }
+  const updatedDoc = dataStore.updateDocument(doc.id, updatePayload);
+  if (savedSignedPath) {
+    console.log(`[Approve Principal] ✅ Đã lưu tệp ký số phần cứng USB Token Ban Giám hiệu: ${savedSignedPath}`);
+    if (fs.existsSync(savedSignedPath)) {
+      googleDriveService.uploadToGoogleDrive(updatedDoc, savedSignedPath)
+        .then(driveRes => {
+          if (!driveRes || !driveRes.fileId || !driveRes.viewUrl) throw new Error('Google Drive trả về response không hợp lệ');
+          Promise.resolve(dataStore.updateDocument(updatedDoc.id, {
+            driveInfo: {
+              fileId: driveRes.fileId,
+              viewUrl: driveRes.viewUrl,
+              folderPath: driveRes.folderPath || '',
+              uploadedAt: driveRes.uploadedAt || new Date().toISOString()
+            }
+          })).catch(err => console.error('[DataStore] Lỗi cập nhật Drive info:', err.message));
+        })
+        .catch(e => console.error('[Google Drive] Lỗi tự động sao lưu BGH:', e.message));
     }
   } else {
+    // Ký số mật mã PAdES X.509 chuẩn hóa khi không tải lên tệp ký trước
+    // Bắt đầu quy trình ký số máy chủ tự động
     // Tự động ký số mật mã PAdES X.509 khi Ban Giám hiệu duyệt
     pdfSignerService.signWithRealVgca(updatedDoc)
       .then(result => {
         if (result && result.signedFilePath) {
-          dataStore.updateDocument(updatedDoc.id, {
-            realSignedPath: result.signedFilePath,
-            realVgcaSigned: true,
-            realSignedAt: now
-          });
+          Promise.resolve(dataStore.updateDocument(updatedDoc.id, {
+            realSignedPath: result.signedFilePath, realVgcaSigned: true, realSignedAt: now
+          })).catch(err => console.error('[DataStore] Lỗi cập nhật VGCA info:', err.message));
           console.log(`[Approve Principal] ✅ Đã niêm phong chữ ký số PAdES X.509 cho hồ sơ ${updatedDoc.id}`);
 
           // Tự động sao lưu file đã ký số thật lên Google Drive của trường
           if (fs.existsSync(result.signedFilePath)) {
             googleDriveService.uploadToGoogleDrive(updatedDoc, result.signedFilePath)
               .then(driveRes => {
+                if (!driveRes || !driveRes.fileId || !driveRes.viewUrl) throw new Error('Google Drive trả về response không hợp lệ');
                 const driveLogs = [
-                  ...updatedDoc.logs,
+                  ...(Array.isArray(updatedDoc.logs) ? updatedDoc.logs : []),
                   {
                     time: new Date().toISOString().replace('T', ' ').substring(0, 19),
-                    actor: `${currentUser.name} (Ban Giám hiệu)`,
-                    action: `Đã tự động sao lưu và đồng bộ hồ sơ lên Google Drive trường: "${driveRes.folderPath}"`
+                    actor: `${currentUser?.name || 'Ban Giám hiệu'} (Ban Giám hiệu)`,
+                    action: `Đã tự động sao lưu và đồng bộ hồ sơ lên Google Drive trường: "${driveRes.folderPath || ''}"`
                   }
                 ];
-                dataStore.updateDocument(updatedDoc.id, {
+                Promise.resolve(dataStore.updateDocument(updatedDoc.id, {
                   driveInfo: {
                     fileId: driveRes.fileId,
                     viewUrl: driveRes.viewUrl,
-                    folderPath: driveRes.folderPath,
-                    uploadedAt: driveRes.uploadedAt
+                    folderPath: driveRes.folderPath || '',
+                    uploadedAt: driveRes.uploadedAt || new Date().toISOString()
                   },
                   logs: driveLogs
+                })).catch(err => {
+                  console.error('[DataStore] Lỗi lưu trạng thái sao lưu:', err.message);
                 });
               })
               .catch(e => console.error('[Google Drive] Lỗi tự động sao lưu BGH:', e.message));
@@ -5407,15 +5406,16 @@ app.post('/api/documents/:id/approve-principal', requireAuth, (req, res) => {
         }
       })
       .catch(signErr => console.warn('[Approve Principal] Lỗi khi ký số tự động:', signErr.message));
+    // Kết thúc chuỗi ký số tự động và đồng bộ lưu trữ
   }
 
   // Bắn Web Push thông báo cho tác giả
   if (doc.authorId) {
-    notifyUserWebPush(doc.authorId, {
+    Promise.resolve(notifyUserWebPush(doc.authorId, {
       title: 'Hồ sơ đã được Ban Giám hiệu phê duyệt',
       body: `Hồ sơ "${doc.title}" đã được Ban Giám hiệu phê duyệt và đóng dấu đỏ hoàn tất!`,
       url: `/?docId=${doc.id}`
-    });
+    })).catch(err => console.warn('[WebPush] Lỗi gửi push BGH duyệt:', err.message));
   }
 
   // Khắc phục DEFECT-ZALO-06: Tự động gửi Zalo thông báo Hoàn tất Ký số & Đóng dấu cho Giáo viên
@@ -5444,19 +5444,19 @@ app.post('/api/documents/:id/reject', requireAuth, (req, res) => {
     const currentUser = req.user;
     const doc = dataStore.getDocumentById(req.params.id);
     if (!doc) return res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ' });
-
     const isDesignated = doc.nextSignerId === currentUser.id || doc.nextSignerId === currentUser.username;
     const isLeaderOrAdmin = currentUser.role === 'HEAD_DEPT' || currentUser.role === 'ADMIN' || currentUser.role === 'BGH';
     if (!isDesignated && !isLeaderOrAdmin) {
       return res.status(403).json({ success: false, message: 'Bạn không có quyền từ chối hồ sơ này!' });
     }
-
-    const { reason = '' } = req.body;
+    const { reason = '' } = req.body || {};
     const trimmedReason = String(reason).trim();
     if (!trimmedReason) {
       return res.status(400).json({ success: false, message: 'Vui lòng nhập lý do trả về / yêu cầu sửa lại.' });
     }
-
+    if (trimmedReason.length > 2000) {
+      return res.status(400).json({ success: false, message: 'Lý do từ chối không được vượt quá 2000 ký tự.' });
+    }
     const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
     const updatedLogs = [
       ...(doc.logs || []),
@@ -5482,18 +5482,18 @@ app.post('/api/documents/:id/reject', requireAuth, (req, res) => {
 
     // 1. Gửi Web Push
     if (doc.authorId) {
-      notifyUserWebPush(doc.authorId, {
+      Promise.resolve(notifyUserWebPush(doc.authorId, {
         title: 'Hồ sơ bị từ chối / trả về chỉnh sửa',
         body: `Hồ sơ "${doc.title}" bị từ chối bởi ${currentUser.name}: ${trimmedReason}`,
         url: `/?docId=${doc.id}`
-      });
+      })).catch(err => console.warn('[WebPush] Lỗi gửi push từ chối:', err.message));
     }
 
     // 2. Gửi Zalo Notify 1-1 cho tác giả
     try {
-      zaloNotifyService.notifyDocumentRejected(updatedDoc, currentUser, trimmedReason).catch(err => {
-        console.warn('[ZaloNotify] Lỗi gửi tin Zalo từ chối:', err.message);
-      });
+      Promise.resolve()
+        .then(() => zaloNotifyService.notifyDocumentRejected(updatedDoc, currentUser, trimmedReason))
+        .catch(err => console.warn('[ZaloNotify] Lỗi gửi tin Zalo từ chối:', err.message));
     } catch (zErr) {
       console.warn('[ZaloNotify] Cảnh báo kích hoạt thông báo từ chối hồ sơ:', zErr.message);
     }
@@ -5510,42 +5510,36 @@ app.post('/api/documents/:id/reject', requireAuth, (req, res) => {
 });
 
 // Thu hồi hồ sơ khi người tiếp theo chưa ký duyệt (Chỉ tác giả hoặc Admin)
-app.post('/api/documents/:id/recall', (req, res) => {
+app.post('/api/documents/:id/recall', requireAuth, (req, res) => {
   const doc = dataStore.getDocumentById(req.params.id);
   if (!doc) return res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ' });
 
-  const currentUser = req.user || getCurrentUser(req);
-  const headerId = (currentUser && currentUser.id) || (req.headers['x-user-id'] || '').trim();
-  const headerUsername = ((currentUser && currentUser.username) || req.headers['x-user-username'] || '').trim().toLowerCase();
-  const headerFullName = (currentUser && (currentUser.name || currentUser.fullName)) || decodeURIComponent(req.headers['x-user-fullname'] || '').trim();
-  const userRole = ((currentUser && currentUser.role) || req.headers['x-user-role'] || '').toUpperCase();
-
-  const hasIdentifier = Boolean(headerId || headerUsername || headerFullName);
-  if (!hasIdentifier && userRole !== 'ADMIN' && userRole !== 'BGH') {
+  // Xác thực danh tính nghiêm ngặt qua JWT token (Không tin cậy header client)
+  const currentUser = req.user;
+  if (!currentUser) {
     return res.status(401).json({ success: false, message: 'Vui lòng đăng nhập để thu hồi hồ sơ.' });
   }
 
+  // Kiểm tra phân quyền: Quản trị viên, Ban Giám hiệu hoặc chính tác giả tạo hồ sơ
+  const userRole = (currentUser.role || '').toUpperCase();
   const isAuthor = (
     userRole === 'ADMIN' || userRole === 'BGH' ||
-    (headerId && (doc.authorId === headerId || doc.creatorId === headerId)) ||
-    (headerUsername && ((doc.authorUsername || '').toLowerCase() === headerUsername || (doc.creatorUsername || '').toLowerCase() === headerUsername)) ||
-    (headerFullName && normalizeVietnamese(doc.author) === normalizeVietnamese(headerFullName))
+    (doc.authorId && doc.authorId === currentUser.id) ||
+    (doc.creatorId && doc.creatorId === currentUser.id) ||
+    (doc.authorUsername && currentUser.username && doc.authorUsername.toLowerCase() === currentUser.username.toLowerCase()) ||
+    (doc.author && currentUser.name && normalizeVietnamese(doc.author) === normalizeVietnamese(currentUser.name))
   );
-
+  // Chặn đứng hành vi thu hồi trái phép hồ sơ của người dùng khác
+  // Chỉ tác giả hồ sơ hoặc cấp lãnh đạo có thẩm quyền mới được thu hồi
   if (!isAuthor) {
     return res.status(403).json({ success: false, message: 'Bạn chỉ có quyền thu hồi hồ sơ do chính mình tạo!' });
   }
-
   // Cho phép thu hồi khi người kế tiếp chưa ký (trạng thái WAITING_LEADER_APPROVAL, WAITING_NEXT_SIGN, IN_PROGRESS, PENDING, PENDING_SIGN)
   const allowedStatuses = ['WAITING_LEADER_APPROVAL', 'WAITING_NEXT_SIGN', 'IN_PROGRESS', 'PENDING', 'PENDING_SIGN'];
   if (!allowedStatuses.includes(doc.status)) {
-    return res.status(400).json({ 
-      success: false, 
-      message: 'Không thể thu hồi hồ sơ khi đã hoàn tất ký duyệt hoặc đã lưu trữ!' 
-    });
+    return res.status(400).json({ success: false, message: 'Không thể thu hồi hồ sơ khi đã hoàn tất ký duyệt hoặc đã lưu trữ!' });
   }
-
-  const actorName = (req.user && (req.user.name || req.user.fullName)) || headerFullName || headerUsername || doc.author || 'Tác giả';
+  const actorName = (currentUser && (currentUser.name || currentUser.fullName)) || currentUser?.username || doc.author || 'Tác giả';
   const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
   const updatedLogs = [
     ...(doc.logs || []),
@@ -5555,7 +5549,6 @@ app.post('/api/documents/:id/recall', (req, res) => {
       action: 'Đã thu hồi hồ sơ trước khi cấp tiếp theo ký duyệt để chỉnh sửa nội dung'
     }
   ];
-
   const updatedDoc = dataStore.updateDocument(doc.id, {
     status: 'RECALLED',
     currentSignerRole: 'Tác giả chỉnh sửa / Nộp lại',
@@ -5564,30 +5557,37 @@ app.post('/api/documents/:id/recall', (req, res) => {
     nextSignerRole: null,
     logs: updatedLogs
   });
-
   console.log(`[Document] Hồ sơ ${doc.id} đã được thu hồi bởi ${actorName}`);
-  res.json({
-    success: true,
-    message: 'Đã thu hồi hồ sơ thành công! Bạn có thể chỉnh sửa nội dung hoặc nộp lại.',
-    data: updatedDoc
-  });
+  res.json({ success: true, message: 'Đã thu hồi hồ sơ thành công! Bạn có thể chỉnh sửa nội dung hoặc nộp lại.', data: updatedDoc });
 });
-
 // Cập nhật nội dung giáo án Word/văn bản sau khi giáo viên chỉnh sửa trong trình soạn thảo
 app.post('/api/documents/:id/update-content', requireAuth, async (req, res) => {
   const doc = dataStore.getDocumentById(req.params.id);
   if (!doc) return res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ' });
-
   const isAuthor = doc.authorId === req.user.id || doc.authorUsername === req.user.username;
   if (req.user.role !== 'ADMIN' && !isAuthor) {
     return res.status(403).json({ success: false, message: 'Bạn chỉ có quyền chỉnh sửa hồ sơ của mình!' });
   }
+  let { title, htmlContent, customContentHtml } = req.body || {};
+  if (title !== undefined && title !== null && typeof title !== 'string') {
+    return res.status(400).json({ success: false, message: 'Tiêu đề không hợp lệ' });
+  }
 
-  const { title, htmlContent } = req.body;
   const updates = {};
-  if (title && title.trim()) updates.title = title.trim();
-  if (htmlContent) {
-    updates.customContentHtml = htmlContent;
+  if (typeof title === 'string' && title.trim()) updates.title = title.trim();
+
+  // Xác thực và sanitize nội dung HTML biên tập bằng thư viện sanitize-html allowlist chuẩn
+  const rawHtml = htmlContent || customContentHtml;
+  if (rawHtml !== undefined && rawHtml !== null) {
+    if (typeof rawHtml !== 'string') return res.status(400).json({ success: false, message: 'Nội dung HTML không hợp lệ' });
+    if (rawHtml.length > 10 * 1024 * 1024) return res.status(413).json({ success: false, message: 'Nội dung vượt quá 10MB' });
+    const sanitizeHtml = require('sanitize-html');
+    const safeHtml = sanitizeHtml(rawHtml, {
+      allowedTags: ['div', 'p', 'span', 'strong', 'em', 'u', 'b', 'i', 'h1', 'h2', 'h3', 'table', 'tbody', 'tr', 'td', 'th', 'br', 'hr', 'ul', 'ol', 'li'],
+      allowedAttributes: { '*': ['style', 'class', 'align'] }
+    });
+    updates.customContentHtml = safeHtml;
+    htmlContent = safeHtml;
     try {
       const htmlDir = path.join(__dirname, 'uploads', 'documents');
       if (!fs.existsSync(htmlDir)) fs.mkdirSync(htmlDir, { recursive: true });
@@ -5596,6 +5596,7 @@ app.post('/api/documents/:id/update-content', requireAuth, async (req, res) => {
       updates.editedHtmlPath = htmlFile;
     } catch (e) {
       console.error('Lỗi lưu tệp HTML chỉnh sửa:', e.message);
+      return res.status(500).json({ success: false, message: 'Không thể lưu tệp HTML chỉnh sửa.' });
     }
   }
 
@@ -5621,85 +5622,84 @@ app.post('/api/documents/:id/update-content', requireAuth, async (req, res) => {
 app.delete('/api/documents/:id', requireAuth, (req, res) => {
   const doc = dataStore.getDocumentById(req.params.id);
   if (!doc) return res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ' });
-
   const isAuthor = doc.authorId === req.user.id || doc.authorUsername === req.user.username;
   if (req.user.role !== 'ADMIN' && !isAuthor) {
     return res.status(403).json({ success: false, message: 'Bạn chỉ có quyền xóa hồ sơ của chính mình!' });
   }
-
   if (doc.status === 'APPROVED' && req.user.role !== 'ADMIN') {
     return res.status(400).json({ success: false, message: 'Hồ sơ đã được Ban Giám hiệu phê duyệt chính thức không thể xóa!' });
   }
-
-  // Dọn dẹp tệp vật lý nếu có
-  try {
-    if (doc.filePath && fs.existsSync(doc.filePath)) fs.unlinkSync(doc.filePath);
-    if (doc.realSignedPath && fs.existsSync(doc.realSignedPath)) fs.unlinkSync(doc.realSignedPath);
-    if (doc.editedHtmlPath && fs.existsSync(doc.editedHtmlPath)) fs.unlinkSync(doc.editedHtmlPath);
-  } catch (e) {
-    console.error('Lỗi dọn dẹp file khi xóa hồ sơ:', e.message);
+  // Xóa bản ghi trong dataStore trước để đảm bảo tính nhất quán dữ liệu
+  const deleted = dataStore.deleteDocument(req.params.id);
+  if (!deleted) return res.status(500).json({ success: false, message: 'Không thể xóa hồ sơ khỏi cơ sở dữ liệu.' });
+  const filesToClean = [doc.filePath, doc.realSignedPath, doc.editedHtmlPath].filter(Boolean);
+  for (const f of filesToClean) {
+    try {
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    } catch (e) {
+      if (e.code !== 'ENOENT') console.warn('[Delete Document] Cảnh báo dọn dẹp file:', e.message);
+    }
   }
-
-  dataStore.deleteDocument(req.params.id);
   res.json({ success: true, message: 'Đã xóa hồ sơ thành công!' });
 });
-
-// Tải file PDF của một hồ sơ
-app.get('/api/documents/:id/download-pdf', (req, res) => {
-  const realSignedPdf = path.join(__dirname, 'GiaoAn_DaKy_That.pdf');
-  const fallbackPdf = path.join(__dirname, 'GiaoAn_CanKy.pdf');
-  const pathToDownload = fs.existsSync(realSignedPdf) ? realSignedPdf : fallbackPdf;
-
-  if (fs.existsSync(pathToDownload)) {
-    res.download(pathToDownload, `GiaoAn_DaKy_VGCA_${req.params.id}.pdf`);
-  } else {
-    res.status(404).json({ success: false, message: 'Chưa có file PDF ký số.' });
-  }
+// Tải file PDF của một hồ sơ hợp lệ có xác thực và phân quyền
+app.get('/api/documents/:id/download-pdf', requireAuth, (req, res) => {
+  const doc = dataStore.getDocumentById(req.params.id);
+  if (!doc) return res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ.' });
+  const u = req.user;
+  const isOwner = doc.authorId === u.id || doc.creatorId === u.id || doc.authorUsername === u.username;
+  const isAuthorized = u.role === 'ADMIN' || u.role === 'BGH' || u.role === 'HEAD_DEPT' || isOwner || doc.nextSignerId === u.id;
+  if (!isAuthorized) return res.status(403).json({ success: false, message: 'Bạn không có quyền tải hồ sơ này.' });
+  const targetPdf = [doc.realSignedPath, doc.signedFilePath, doc.filePath].find(p => p && fs.existsSync(p));
+  if (!targetPdf) return res.status(404).json({ success: false, message: 'Chưa có file PDF ký số cho hồ sơ này.' });
+  return res.download(targetPdf, `GiaoAn_DaKy_VGCA_${doc.id}.pdf`);
 });
-
 // ==================== 6. BÁO CÁO THỐNG KÊ (DÀNH CHO ADMIN) ====================
-app.get('/api/stats', requireAuth, (req, res) => {
-  const allDocs = dataStore.getDocuments();
+app.get('/api/stats', requireAdmin, (req, res) => {
+  const allDocs = (dataStore.getDocuments() || []).filter(Boolean);
   const total = allDocs.length;
   const approved = allDocs.filter(d => d.status === 'APPROVED').length;
   const waitingLeader = allDocs.filter(d => d.status === 'WAITING_LEADER_APPROVAL').length;
   const waitingPrincipal = allDocs.filter(d => d.status === 'WAITING_PRINCIPAL_APPROVAL').length;
   const draftOrReject = allDocs.filter(d => d.status === 'DRAFT' || d.status === 'REJECTED').length;
-
-  const deptStats = dataStore.DEPARTMENTS.map(deptName => {
+  const deptStats = (dataStore.DEPARTMENTS || []).map(deptName => {
     const deptDocs = allDocs.filter(d => d.department === deptName);
     return {
-      name: deptName,
-      total: deptDocs.length,
+      name: deptName, total: deptDocs.length,
       approved: deptDocs.filter(d => d.status === 'APPROVED').length,
-      pending: deptDocs.filter(d => d.status.includes('WAITING')).length
+      pending: deptDocs.filter(d => typeof d.status === 'string' && d.status.includes('WAITING')).length
     };
   });
-
   res.json({
     success: true,
     data: {
-      total,
-      approved,
-      waitingLeader,
-      waitingPrincipal,
-      draftOrReject,
+      total, approved, waitingLeader, waitingPrincipal, draftOrReject,
       complianceRate: total > 0 ? Math.round((approved / total) * 100) : 0,
       schoolName: 'TRƯỜNG TRUNG HỌC CƠ SỞ CHU VĂN AN',
       departments: deptStats
     }
   });
 });
-
 // ==================== 7. CẤU HÌNH GOOGLE DRIVE ====================
+const maskDriveCfg = c => ({ enabled: Boolean(c?.enabled), autoUploadOnSign: Boolean(c?.autoUploadOnSign), schoolFolderId: c?.schoolFolderId || '', schoolFolderName: c?.schoolFolderName || '', backupLocalStorage: Boolean(c?.backupLocalStorage), hasGasWebhookUrl: Boolean(c?.gasWebhookUrl) });
 app.get('/api/drive/config', requireAuth, (req, res) => {
-  res.json({ success: true, data: googleDriveService.getDriveConfig() });
+  res.json({ success: true, data: maskDriveCfg(googleDriveService.getDriveConfig()) });
 });
-
+// Cập nhật cấu hình Google Drive an toàn (xác thực đối tượng, whitelist trường, không lộ secret)
+// Triệt tiêu nguy cơ rò rỉ webhook secret token ra bên ngoài client hoặc log mạng
 app.post('/api/drive/config', requireAdmin, (req, res) => {
-  const cfg = req.body;
-  googleDriveService.saveDriveConfig(cfg);
-  res.json({ success: true, message: 'Đã cập nhật cấu hình Google Drive!', data: cfg });
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) return res.status(400).json({ success: false, message: 'Dữ liệu cấu hình Google Drive không hợp lệ!' });
+  const cur = googleDriveService.getDriveConfig() || {}, b = req.body;
+  const safeCfg = {
+    enabled: typeof b.enabled === 'boolean' ? b.enabled : Boolean(cur.enabled),
+    autoUploadOnSign: typeof b.autoUploadOnSign === 'boolean' ? b.autoUploadOnSign : Boolean(cur.autoUploadOnSign),
+    schoolFolderId: typeof b.schoolFolderId === 'string' ? b.schoolFolderId.trim() : (cur.schoolFolderId || ''),
+    schoolFolderName: typeof b.schoolFolderName === 'string' ? b.schoolFolderName.trim() : (cur.schoolFolderName || ''),
+    gasWebhookUrl: typeof b.gasWebhookUrl === 'string' ? b.gasWebhookUrl.trim() : (cur.gasWebhookUrl || ''),
+    backupLocalStorage: typeof b.backupLocalStorage === 'boolean' ? b.backupLocalStorage : Boolean(cur.backupLocalStorage)
+  };
+  googleDriveService.saveDriveConfig(safeCfg);
+  res.json({ success: true, message: 'Đã cập nhật cấu hình Google Drive!', data: maskDriveCfg(safeCfg) });
 });
 
 app.post('/api/drive/test', requireAdmin, async (req, res) => {
@@ -5739,129 +5739,129 @@ app.post('/api/drive/test', requireAdmin, async (req, res) => {
   }
 });
 
-// Upload tệp đã ký hoặc đã đóng dấu lên Google Drive từ client hoặc tiến trình ký
-app.post('/api/drive/upload', async (req, res) => {
+// Upload tệp đã ký hoặc đã đóng dấu lên Google Drive có xác thực, kiểm tra dung lượng và quyền sở hữu
+app.post('/api/drive/upload', requireAuth, async (req, res) => {
   try {
-    const { doc, fileBase64 } = req.body;
-    if (!doc || !fileBase64) {
-      return res.status(400).json({ success: false, message: 'Thiếu thông tin doc hoặc fileBase64' });
-    }
-    const result = await googleDriveService.uploadToGoogleDrive(doc, fileBase64);
+    const { doc, fileBase64 } = req.body || {};
+    if (!doc || typeof doc !== 'object' || typeof fileBase64 !== 'string' || !fileBase64.trim()) return res.status(400).json({ success: false, message: 'Thiếu thông tin doc hoặc fileBase64 không hợp lệ!' });
+    if (fileBase64.length > 35 * 1024 * 1024) return res.status(413).json({ success: false, message: 'Dung lượng tệp vượt quá giới hạn 35MB!' });
+    const cleanB64 = fileBase64.replace(/^data:application\/pdf;base64,/, '').trim(), pdfBuf = Buffer.from(cleanB64, 'base64');
+    if (!/^[A-Za-z0-9+/=]+$/.test(cleanB64) || cleanB64.length < 32 || !pdfBuf.subarray(0, 5).toString('ascii').startsWith('%PDF-') || !verifySchoolSealArtifact(pdfBuf)) return res.status(400).json({ success: false, message: 'Tệp PDF không chứa chữ ký số hoặc con dấu hợp lệ của nhà trường!' });
+    const targetDoc = (doc.id && typeof doc.id === 'string') ? dataStore.getDocumentById(doc.id.trim()) : null;
+    if (!targetDoc) return res.status(404).json({ success: false, message: 'Hồ sơ không tồn tại trong hệ thống!' });
+    const u = req.user, isOwner = targetDoc.authorId === u.id || targetDoc.creatorId === u.id || targetDoc.authorUsername === u.username;
+    if (u.role !== 'ADMIN' && u.role !== 'BGH' && u.role !== 'HEAD_DEPT' && !isOwner) return res.status(403).json({ success: false, message: 'Bạn không có quyền tải hồ sơ này lên Google Drive!' });
+    const result = await googleDriveService.uploadToGoogleDrive(targetDoc, cleanB64);
     res.json({ success: true, data: result });
   } catch (err) {
     console.warn('[server.js /api/drive/upload] Lỗi tải Drive:', err.message);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json({ success: false, message: 'Không thể tải tệp lên Google Drive. Vui lòng thử lại hoặc liên hệ Quản trị viên.' });
   }
 });
-
 // ==================== CẤU HÌNH & ĐỒNG BỘ MICROSOFT ONEDRIVE 5TB ====================
-app.get('/api/onedrive/config', requireAuth, (req, res) => {
-  res.json({ success: true, data: oneDriveService.getOneDriveConfig() });
-});
-
+const maskOneDriveCfg = c => ({ enabled: Boolean(c?.enabled), autoSyncOnSign: Boolean(c?.autoSyncOnSign), storageQuota: typeof c?.storageQuota === 'string' ? c.storageQuota : '5 TB', schoolName: c?.schoolName || '', department: c?.department || '', teacherName: c?.teacherName || '', academicYear: c?.academicYear || '', oneDriveFolderPath: c?.oneDriveFolderPath || '', detected: Boolean(c?.detected) });
+app.get('/api/onedrive/config', requireAuth, (req, res) => res.json({ success: true, data: maskOneDriveCfg(oneDriveService.getOneDriveConfig()) }));
 app.post('/api/onedrive/config', requireAdmin, (req, res) => {
-  const cfg = req.body;
-  oneDriveService.saveOneDriveConfig(cfg);
-  res.json({ success: true, message: 'Đã cập nhật cấu hình OneDrive!', data: cfg });
-});
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) return res.status(400).json({ success: false, message: 'Dữ liệu cấu hình OneDrive không hợp lệ!' });
+  const cur = oneDriveService.getOneDriveConfig() || {}, b = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {}; const rawFolder = typeof b.oneDriveFolderPath === 'string' ? b.oneDriveFolderPath.trim() : ''; const cleanFolder = (rawFolder && rawFolder.length <= 300 && !rawFolder.includes('..') && !path.isAbsolute(rawFolder)) ? path.normalize(rawFolder) : (cur.oneDriveFolderPath || ''); const safeCfg = { enabled: typeof b.enabled === 'boolean' ? b.enabled : Boolean(cur.enabled), autoSyncOnSign: typeof b.autoSyncOnSign === 'boolean' ? b.autoSyncOnSign : Boolean(cur.autoSyncOnSign), storageQuota: typeof b.storageQuota === 'string' ? b.storageQuota.trim().slice(0, 20) : (cur.storageQuota || '5 TB'), schoolName: typeof b.schoolName === 'string' ? b.schoolName.trim().slice(0, 120) : (cur.schoolName || ''), department: typeof b.department === 'string' ? b.department.trim().slice(0, 120) : (cur.department || ''), teacherName: typeof b.teacherName === 'string' ? b.teacherName.trim().slice(0, 100) : (cur.teacherName || ''), academicYear: typeof b.academicYear === 'string' ? b.academicYear.trim().slice(0, 50) : (cur.academicYear || ''), oneDriveFolderPath: cleanFolder, detected: Boolean(cur.detected) }; oneDriveService.saveOneDriveConfig(safeCfg); res.json({ success: true, message: 'Đã cập nhật cấu hình OneDrive!', data: maskOneDriveCfg(safeCfg) }); });
 
 app.post('/api/documents/:id/sync-onedrive', requireAuth, async (req, res) => {
-  const doc = dataStore.getDocumentById(req.params.id);
+  let doc;
+  try { doc = dataStore.getDocumentById(req.params.id); } catch (err) {
+    console.error('[OneDrive Sync] Không đọc được hồ sơ:', err);
+    return res.status(500).json({ success: false, message: 'Không thể đọc hồ sơ' });
+  }
   if (!doc) return res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ' });
-
-  const uploadDir = path.join(__dirname, 'uploads', 'documents');
-  const candidates = [
-    doc.realSignedPath ? path.resolve(doc.realSignedPath) : '',
-    path.join(uploadDir, `signed_${doc.id}.pdf`),
-    doc.signedFilePath ? path.resolve(doc.signedFilePath) : '',
-    doc.filePath ? path.resolve(doc.filePath) : '',
-    path.join(__dirname, 'GiaoAn_DaKy_That.pdf')
-  ];
-  let pathToUpload = candidates.find(p => p && fs.existsSync(p) && fs.statSync(p).size > 100);
-
+  const u = req.user || {}, isOwner = Boolean(u.id && (doc.authorId === u.id || doc.creatorId === u.id)) || Boolean(u.username && doc.authorUsername && String(doc.authorUsername).trim().toLowerCase() === String(u.username).trim().toLowerCase()); if (u.role !== 'ADMIN' && u.role !== 'BGH' && u.role !== 'HEAD_DEPT' && !isOwner) return res.status(403).json({ success: false, message: 'Bạn không có quyền đồng bộ hồ sơ này lên OneDrive!' });
+  const uploadDir = path.resolve(__dirname, 'uploads', 'documents'), safeId = String(doc.id).replace(/[^a-zA-Z0-9_\-]/g, '');
+  const toCand = p => (typeof p === 'string' && p.trim()) ? path.resolve(uploadDir, path.basename(p.trim())) : '';
+  const candidates = [ path.join(uploadDir, `signed_${safeId}.pdf`), path.join(uploadDir, `Signed_${safeId}.pdf`), toCand(doc.realSignedPath), toCand(doc.signedFilePath), toCand(doc.filePath) ];
+  const checkFile = p => { try { if (!p || typeof p !== 'string') return false; const r = path.resolve(p), rel = path.relative(uploadDir, r); if (rel.startsWith('..') || path.isAbsolute(rel) || !isWithinUploadRoot(r)) return false; return fs.existsSync(r) && fs.statSync(r).size > 100; } catch (e) { return false; } };
+  let pathToUpload = candidates.find(checkFile), tempSyncFile = null;
   if (!pathToUpload) {
     try {
       const generatedBuf = await pdfSignerService.generateSignedPdf(doc);
-      const tempPath = path.join(uploadDir, `temp_sync_onedrive_${doc.id}.pdf`);
+      const tempPath = path.join(uploadDir, `temp_sync_${safeId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.pdf`);
       fs.writeFileSync(tempPath, generatedBuf);
       pathToUpload = tempPath;
+      tempSyncFile = tempPath;
     } catch (e) {
-      return res.status(500).json({ success: false, message: 'Không tạo được tệp PDF để nộp lên OneDrive: ' + e.message });
+      return res.status(500).json({ success: false, message: 'Không tạo được tệp PDF để nộp lên OneDrive' });
     }
   }
-
+  let result;
   try {
-    const result = await oneDriveService.syncDocumentToOneDrive(doc, pathToUpload);
-    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    result = await oneDriveService.syncDocumentToOneDrive(doc, pathToUpload);
+  } catch (err) {
+    console.warn('[OneDrive Sync] Lỗi tải lên OneDrive:', err.message);
+    return res.status(500).json({ success: false, message: 'Lỗi đồng bộ OneDrive. Vui lòng thử lại sau.' });
+  } finally {
+    if (tempSyncFile) { try { if (fs.existsSync(tempSyncFile)) fs.unlinkSync(tempSyncFile); } catch (cleanErr) { console.warn('[OneDrive Sync] Không thể xóa tệp tạm:', cleanErr.message); } }
+  }
+  if (!result || typeof result !== 'object' || typeof result.destinationPath !== 'string') return res.status(502).json({ success: false, message: 'Dữ liệu phản hồi từ dịch vụ OneDrive không hợp lệ' });
+  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  try {
     dataStore.updateDocument(doc.id, {
       oneDriveSynced: true,
       oneDrivePath: result.destinationPath,
-      oneDriveCategory: result.category,
+      oneDriveCategory: result.category || '',
       oneDriveSyncedAt: now,
       isArchived: true,
       status: 'ARCHIVED',
       archivedAt: now,
       logs: [
-        ...(doc.logs || []),
-        {
-          time: now,
-          actor: `${req.user.name} (${req.user.role})`,
-          action: `Đã nộp thành công vào OneDrive trường (5TB): ${result.category} / ${result.fileName}`
-        }
+        ...(Array.isArray(doc.logs) ? doc.logs : []),
+        { time: now, actor: `${(req.user && req.user.name) || 'unknown'} (${(req.user && req.user.role) || 'unknown'})`, action: `Đã nộp thành công vào OneDrive trường (5TB): ${result.category || ''} / ${result.fileName || path.basename(result.destinationPath)}` }
       ]
     });
-    res.json({
-      success: true,
-      message: result.message,
-      data: result,
-      oneDriveInfo: result
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Lỗi đồng bộ OneDrive: ' + err.message });
+  } catch (dbErr) {
+    console.error(`[OneDrive Sync] Đã upload thành công [${result.destinationPath}] nhưng lỗi cập nhật DB cho [${doc.id}]:`, dbErr.message);
+    return res.json({ success: true, warning: 'Đã tải lên OneDrive nhưng chưa cập nhật dữ liệu cục bộ', data: result, oneDriveInfo: result });
   }
+  res.json({ success: true, message: result.message || 'Đã đồng bộ lên OneDrive thành công', data: result, oneDriveInfo: result });
 });
 
 app.post('/api/documents/:id/mark-onedrive-synced', requireAuth, (req, res) => {
-  const doc = dataStore.getDocumentById(req.params.id);
+  let doc;
+  try {
+    doc = dataStore.getDocumentById(req.params.id);
+  } catch (err) { return res.status(500).json({ success: false, message: 'Không thể đọc hồ sơ' }); }
   if (!doc) return res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ' });
-
-  const { fileName, category, folderName } = req.body || {};
+  const u = req.user || {}, isOwner = Boolean(u.id && (doc.authorId === u.id || doc.creatorId === u.id)) || Boolean(u.username && doc.authorUsername && String(doc.authorUsername).trim().toLowerCase() === String(u.username).trim().toLowerCase());
+  if (u.role !== 'ADMIN' && u.role !== 'BGH' && u.role !== 'HEAD_DEPT' && !isOwner) return res.status(403).json({ success: false, message: 'Bạn không có quyền đánh dấu đồng bộ hồ sơ này lên OneDrive!' });
+  const b = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+  const rawTitle = (typeof doc.title === 'string' && doc.title.trim()) ? doc.title.trim() : 'document';
+  const fileName = (typeof b.fileName === 'string' && b.fileName.trim()) ? path.basename(b.fileName.trim()).slice(0, 150) : `${rawTitle}.pdf`;
+  const category = (typeof b.category === 'string' && b.category.trim()) ? b.category.trim().slice(0, 120) : '2. KẾ HOẠCH BÀI DẠY';
+  const folderName = (typeof b.folderName === 'string' && b.folderName.trim()) ? b.folderName.trim().slice(0, 120) : 'OneDrive Trường';
   const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
-
-  dataStore.updateDocument(doc.id, {
-    oneDriveSynced: true,
-    oneDriveCategory: category || '2. KẾ HOẠCH BÀI DẠY',
-    oneDriveSyncedAt: now,
-    oneDriveInfo: {
-      success: true,
-      category: category || '2. KẾ HOẠCH BÀI DẠY',
-      fileName: fileName || (doc.title + '.pdf'),
-      sharedFolder: folderName || 'OneDrive Trường',
-      syncedAt: now
-    },
-    isArchived: true,
-    status: 'ARCHIVED',
-    archivedAt: now,
-    logs: [
-      ...(doc.logs || []),
-      {
-        time: now,
-        actor: `${req.user.name} (${req.user.role})`,
-        action: `Đã lưu thành công vào OneDrive (5TB) máy tính: ${category || 'Kế hoạch bài dạy'} / ${fileName || (doc.title + '.pdf')}`
-      }
-    ]
-  });
-
+  const oneDriveInfo = { success: true, category, fileName, sharedFolder: folderName, syncedAt: now };
+  try {
+    dataStore.updateDocument(doc.id, {
+      oneDriveSynced: true,
+      oneDriveCategory: category,
+      oneDriveSyncedAt: now,
+      oneDriveInfo,
+      isArchived: true,
+      status: 'ARCHIVED',
+      archivedAt: now,
+      logs: [
+        ...(Array.isArray(doc.logs) ? doc.logs : []),
+        {
+          time: now,
+          actor: `${(u.name || 'unknown')} (${(u.role || 'unknown')})`,
+          action: `Đã lưu thành công vào OneDrive (5TB) máy tính: ${category} / ${fileName}`
+        }
+      ]
+    });
+  } catch (dbErr) {
+    console.error(`[OneDrive Mark] Lỗi cập nhật DB cho [${doc.id}]:`, dbErr.message);
+    return res.status(500).json({ success: false, message: 'Lỗi cập nhật trạng thái đồng bộ hồ sơ' });
+  }
   res.json({
     success: true,
     message: 'Đã ghi nhận lưu OneDrive thành công!',
-    oneDriveInfo: {
-      success: true,
-      category: category || '2. KẾ HOẠCH BÀI DẠY',
-      fileName: fileName || (doc.title + '.pdf'),
-      sharedFolder: folderName || 'OneDrive Trường',
-      syncedAt: now
-    }
+    oneDriveInfo
   });
 });
 
@@ -5896,114 +5896,114 @@ function getSignerExecution() {
 }
 
 app.post('/api/sign-real-pdf', requireAuth, async (req, res) => {
-  const inputPdf = path.join(__dirname, 'GiaoAn_CanKy.pdf');
-  const outputPdf = path.join(__dirname, 'GiaoAn_DaKy_That.pdf');
-  const reason = req.body.reason || 'Phê duyệt Kế hoạch bài dạy';
-  const location = req.body.location || 'Trường THCS Chu Văn An - Xã Đăk Hà';
-
-  const signer = getSignerExecution();
-  if (signer) {
-    execFile(signer.file, [...signer.argsPrefix, inputPdf, outputPdf, reason, location], { timeout: 120000 }, async (error, stdout, stderr) => {
-      if (!error && fs.existsSync(outputPdf) && fs.statSync(outputPdf).size > 100) {
-        return res.json({
-          success: true,
-          message: 'Ký số mật mã chuyên dùng VGCA thành công 100%! Đã tạo file PDF có chứng thực.',
-          downloadUrl: '/api/download-signed-pdf',
-          outputLog: stdout
-        });
-      }
-      await performCloudPdfSign();
-    });
-  } else {
-    await performCloudPdfSign();
-  }
-
-  async function performCloudPdfSign() {
-    try {
-      const mockDoc = {
-        id: 'DEMO_' + Date.now(),
-        title: 'Kế hoạch bài dạy mẫu ký số VGCA',
-        grade: 'Khối 9',
-        week: 'Tuần 12',
-        author: 'Hà Văn Tý',
-        department: 'Tổ Toán - Tin',
-        signatures: [{
-          step: 1,
-          role: 'Giáo viên',
-          signerName: 'Hà Văn Tý',
-          signType: 'Ký số mật mã thật Ban Cơ yếu Chính phủ (VGCA X.509 PAdES)',
-          signedAt: new Date().toISOString().replace('T', ' ').substring(0, 19),
-          status: 'VALID'
-        }]
-      };
-      const signedBuf = await pdfSignerService.generateSignedPdf(mockDoc);
-      writePdfAtomically(outputPdf, signedBuf);
-      res.json({
-        success: true,
-        message: 'Ký số mật mã chuyên dùng VGCA thành công 100%! Đã niêm phong file PDF chuẩn PAdES X.509.',
-        downloadUrl: '/api/download-signed-pdf',
-        outputLog: '[VGCA Cloud Signer] Đã niêm phong chứng thư số Ban Cơ yếu Chính phủ (Hà Văn Tý)'
-      });
-    } catch (e) {
-      res.status(500).json({ success: false, message: 'Lỗi ký số: ' + e.message });
+  const reqId = crypto.randomBytes(8).toString('hex');
+  const tempDir = path.join(__dirname, 'uploads', 'temp_signs');
+  const outputPdf = path.join(tempDir, `signed_${reqId}.pdf`);
+  const legacyOutputPdf = path.join(__dirname, 'GiaoAn_DaKy_That.pdf');
+  const cleanTemp = () => { try { if (fs.existsSync(outputPdf)) fs.unlinkSync(outputPdf); } catch (e) { console.warn('[Sign Real PDF] Lỗi dọn tệp tạm:', e && e.message); } };
+  try {
+    if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+    const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+    const reason = (typeof body.reason === 'string' && body.reason.trim().length <= 200) ? body.reason.trim() : 'Phê duyệt Kế hoạch bài dạy';
+    const location = (typeof body.location === 'string' && body.location.trim().length <= 200) ? body.location.trim() : 'Trường THCS Chu Văn An - Xã Đăk Hà';
+    const inputPdf = path.join(__dirname, 'GiaoAn_CanKy.pdf');
+    if (!fs.existsSync(inputPdf)) return res.status(404).json({ success: false, message: 'Không tìm thấy tệp PDF gốc để ký!' });
+    const signer = getSignerExecution();
+    if (!signer) {
+      return res.status(503).json({ success: false, message: 'Dịch vụ ký số VGCA không khả dụng trên hệ thống máy chủ' });
     }
+    const signRes = await new Promise(resolve => {
+      execFile(signer.file, [...signer.argsPrefix, inputPdf, outputPdf, reason, location], { timeout: 120000 }, (error, stdout, stderr) => {
+        let validOutput = false;
+        try { validOutput = fs.statSync(outputPdf).size > 100; } catch (_) { validOutput = false; }
+        if (!error && validOutput) {
+          resolve({ ok: true, log: stdout || '' });
+        } else {
+          resolve({ ok: false, log: (stderr || (error && error.message) || 'Ký số thất bại') });
+        }
+      });
+    });
+    if (!signRes.ok) {
+      cleanTemp();
+      console.warn('[Sign Real PDF] Quá trình ký số thất bại:', signRes.log);
+      return res.status(502).json({
+        success: false,
+        message: 'Ký số VGCA thất bại từ tiến trình chuyên dụng'
+      });
+    }
+    try { fs.copyFileSync(outputPdf, legacyOutputPdf); } catch (cpErr) {
+      console.warn('[Sign Real PDF] Lỗi copy sang output mặc định:', cpErr.message);
+    }
+    cleanTemp();
+    console.log('[Sign Real PDF] Ký số mật mã chuyên dùng VGCA thành công:', outputPdf);
+    return res.json({
+      success: true,
+      message: 'Ký số mật mã chuyên dùng VGCA thành công 100%! Đã tạo file PDF có chứng thực.',
+      downloadUrl: '/api/download-signed-pdf'
+    });
+  } catch (err) {
+    cleanTemp();
+    console.error('[Sign Real PDF] Lỗi ngoại lệ hệ thống:', err);
+    return res.status(500).json({ success: false, message: 'Lỗi hệ thống trong quá trình ký số' });
+  } finally {
+    cleanTemp();
   }
 });
 
-app.get('/api/verify-real-pdf', (req, res) => {
-  const pdfPath = path.join(__dirname, 'GiaoAn_DaKy_That.pdf');
-  if (!fs.existsSync(pdfPath)) {
-    return res.status(404).json({ success: false, message: 'File GiaoAn_DaKy_That.pdf chưa tồn tại!' });
+// Middleware kiểm soát quyền tra cứu chữ ký số chuyên dụng VGCA
+// Hỗ trợ phiên xác thực RBAC người dùng hoặc Cổng tra cứu công khai (Nghị định 130/2018/NĐ-CP)
+function verifyAccessGuard(req, res, next) {
+  const user = getCurrentUser(req);
+  if (user) {
+    req.user = user;
+    return next();
   }
+  // Public Verification Portal theo Nghị định 130/2018/NĐ-CP cho phép công chúng đối soát chữ ký số
+  req.isPublicVerification = true;
+  next();
+}
 
-  const signer = getSignerExecution();
-  if (!signer || !signer.file) {
-    return res.json({
-      success: true,
-      data: {
-        isValid: true,
-        coversWholeDoc: true,
-        issuer: 'Ban Cơ yếu Chính phủ',
-        subject: realSigner.name,
-        signedAt: new Date().toLocaleDateString('vi-VN'),
-        rawOutput: 'HỢP LỆ TUYỆT ĐỐI (Verified by Ban Cơ yếu Chính phủ VGCA)'
-      }
+app.get('/api/verify-real-pdf', verifyAccessGuard, (req, res) => {
+  const targetName = 'GiaoAn_DaKy_That.pdf';
+  const pdfPath = path.resolve(__dirname, targetName);
+  if (!pdfPath.startsWith(__dirname) || !fs.existsSync(pdfPath)) {
+    return res.status(404).json({
+      success: false,
+      message: 'File GiaoAn_DaKy_That.pdf chưa tồn tại!'
     });
   }
-
+  const signer = getSignerExecution();
+  if (!signer || !signer.file) {
+    return res.status(503).json({
+      success: false,
+      message: 'Dịch vụ xác thực chữ ký số VGCA không khả dụng trên hệ thống máy chủ',
+      data: { isValid: false, coversWholeDoc: false }
+    });
+  }
   execFile(signer.file, [...signer.argsPrefix, '--verify', pdfPath], { timeout: 30000 }, (error, stdout, stderr) => {
     if (error) {
-      console.warn('[Verify PDF] Cảnh báo khi thực thi verify:', error.message);
-      const outText = stdout || stderr || '';
-      const hasValidText = outText.includes('HỢP LỆ TUYỆT ĐỐI');
-      return res.json({
-        success: true,
-        data: {
-          isValid: hasValidText,
-          coversWholeDoc: outText.includes('Covers whole doc): CÓ'),
-          issuer: 'C=VN,O=Ban Cơ yếu Chính phủ,CN=CA phục vụ các cơ quan Nhà nước G2',
-          subject: 'C=VN,L=Quảng Ngãi,O=ỦY BAN NHÂN DÂN TỈNH QUẢNG NGÃI,OU=ỦY BAN NHÂN DÂN XÃ ĐĂK HÀ,OU=TRƯỜNG TRUNG HỌC CƠ SỞ CHU VĂN AN,CN=Hà Văn Tý,E=hvty-dakha@quangngai.gov.vn',
-          signedAt: '05/09/2026 10:38:09',
-          rawOutput: outText || 'HỢP LỆ TUYỆT ĐỐI (Verified by Ban Cơ yếu Chính phủ VGCA)'
-        }
+      console.warn('[Verify PDF] Lỗi tiến trình xác minh:', error.message);
+      return res.status(502).json({
+        success: false,
+        message: 'Không thể xác minh chữ ký số từ tiến trình chuyên dụng',
+        data: { isValid: false, coversWholeDoc: false }
       });
     }
-
-    const isValid = stdout.includes('HỢP LỆ TUYỆT ĐỐI');
-    const coversWholeDoc = stdout.includes('Covers whole doc): CÓ');
-    const issuerMatch = stdout.match(/Cơ quan cấp phát \(Issuer\): (.*)/);
-    const subjectMatch = stdout.match(/Chủ thể chứng thư \(Subject\): (.*)/);
-    const signTimeMatch = stdout.match(/Thời điểm ký: (.*)/);
-
-    res.json({
+    const outText = stdout || '';
+    const isValid = outText.includes('HỢP LỆ TUYỆT ĐỐI');
+    const coversWholeDoc = outText.includes('Covers whole doc): CÓ');
+    const issuerMatch = outText.match(/Cơ quan cấp phát \(Issuer\): (.*)/);
+    const subjectMatch = outText.match(/Chủ thể chứng thư \(Subject\): (.*)/);
+    const signTimeMatch = outText.match(/Thời điểm ký: (.*)/);
+    return res.json({
       success: true,
       data: {
         isValid,
         coversWholeDoc,
-        issuer: issuerMatch ? issuerMatch[1] : 'Ban Cơ yếu Chính phủ',
-        subject: subjectMatch ? subjectMatch[1] : realSigner.name,
-        signedAt: signTimeMatch ? signTimeMatch[1] : 'Mới đây',
-        rawOutput: stdout
+        issuer: issuerMatch ? issuerMatch[1].trim() : '',
+        subject: subjectMatch ? subjectMatch[1].trim() : '',
+        signedAt: signTimeMatch ? signTimeMatch[1].trim() : '',
+        rawOutput: outText
       }
     });
   });

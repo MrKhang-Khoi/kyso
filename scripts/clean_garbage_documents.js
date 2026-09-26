@@ -16,6 +16,16 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const DOCS_FILE = path.join(ROOT_DIR, 'data', 'documents.json');
 const RTDB_URL = 'https://edusign-school-default-rtdb.asia-southeast1.firebasedatabase.app';
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 6000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function cleanGarbageDocuments() {
   console.log('================================================================================');
   console.log(' 🧹 BẮT ĐẦU DỌN DẸP DỮ LIỆU RÁC THỬ NGHIỆM HỒ SƠ VĂN BẢN EDUSIGN VGCA');
@@ -33,8 +43,12 @@ async function cleanGarbageDocuments() {
     const previousContent = fs.existsSync(DOCS_FILE) ? fs.readFileSync(DOCS_FILE, 'utf8') : '[]';
     let prevCount = 0;
     try {
-      prevCount = JSON.parse(previousContent).length;
-    } catch (e) {}
+      const parsed = JSON.parse(previousContent);
+      prevCount = Array.isArray(parsed) ? parsed.length : 0;
+    } catch (parseErr) {
+      console.warn('⚠️ [1/2] Cảnh báo parse data/documents.json trước đó:', parseErr.message);
+      prevCount = 0;
+    }
 
     fs.writeFileSync(DOCS_FILE, JSON.stringify([], null, 2), 'utf8');
     localCleaned = true;
@@ -48,23 +62,17 @@ async function cleanGarbageDocuments() {
     const targetUrl = `${RTDB_URL}/documents.json`;
     console.log(`🌐 [2/2] Đang kết nối Firebase RTDB: ${targetUrl}...`);
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 6000);
-
-    const res = await fetch(targetUrl, {
-      method: 'DELETE',
-      signal: controller.signal
-    }).catch(async (fetchErr) => {
-      // Thử phương thức PUT [] nếu DELETE bị chặn bởi CORS/Rules
-      return await fetch(targetUrl, {
+    let res = null;
+    try {
+      res = await fetchWithTimeout(targetUrl, { method: 'DELETE' }, 6000);
+    } catch (deleteErr) {
+      console.warn(`⚠️ [2/2] DELETE gặp lỗi (${deleteErr.message}), kích hoạt thử lại với PUT []...`);
+      res = await fetchWithTimeout(targetUrl, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify([]),
-        signal: controller.signal
-      });
-    });
-
-    clearTimeout(timeoutId);
+        body: JSON.stringify([])
+      }, 6000);
+    }
 
     if (res && (res.ok || res.status === 200 || res.status === 204)) {
       rtdbCleaned = true;

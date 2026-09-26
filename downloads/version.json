@@ -10,6 +10,6 @@
     "Hỗ trợ kết nối mượt mà từ Render Cloud (HTTPS) không lo bị chặn CORS/PNA"
   ],
   "downloadUrl": "https://github.com/MrKhang-Khoi/cvakyso/raw/main/docs/downloads/EduSign_Agent.exe",
-  "zipDownloadUrl": "https://github.com/MrKhang-Khoi/cvakyso/raw/main/docs/downloads/EduSign_Agent_v2.0_Setup.zip",
+  "zipDownloadUrl": "https://github.com/MrKhang-Khoi/cvakyso/raw/main/docs/downloads/EduSign_Agent_v2.2.0_Setup.zip",
   "mandatory": false
 }
